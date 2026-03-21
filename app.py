@@ -1,13 +1,11 @@
 # app.py
 # Comparador Telecom Chile - Hogar/Móvil
 # - RUT: autoformato + validación (módulo-11) al escribir (corrige punto fantasma; respeta ceros iniciales)
-# - Dirección: validación/normalización automática (forward search + reverse) con tu función
-# - Solo Hogar: listas blancas de URLs residenciales por proveedor
-# - Velocidad: extraída del nombre o del CONTEXTO HTML cercano al precio (Mbps/Gbps, "Mega(s)", "Mb/s", "Giga", "hasta ...")
-# - Scrapers: Mundo / Movistar / Entel / WOM (+ VTR fallback) para Hogar; Movistar/Entel/WOM para Móvil
-# - Botón "Limpiar filtros" y modo exclusivo Hogar/Móvil
-# - DEDUP + INSIGNIA: evita duplicados por compañía/velocidad/pack (Hogar) y compañía/pack/detalle/Precio (Móvil),
-#   marcando la fila ganadora como "🏷️ Oferta más barata"
+# - Dirección: validación/normalización automática (forward search + reverse)
+# - Solo Hogar: listas blancas de URLs y filtro negativo (empresa/pyme/corporativo/convenios)
+# - Velocidad: extraída del nombre o del CONTEXTO HTML (ventana ±1200)
+# - DEDUP + INSIGNIA: marca "🏷️ Oferta más barata" y queda solo la ganadora
+# - Toggle "Modo desarrollador": oculta/mostrar toolbar, Share, GitHub, etc.
 
 import os
 import re
@@ -25,7 +23,13 @@ from playwright.async_api import async_playwright
 import requests
 
 # =================== Configuración de página ===================
-st.set_page_config(page_title="Comparador Chile", page_icon="📡")
+st.set_page_config(
+    page_title="Comparador Chile",
+    page_icon="📡",
+    # Oculta los ítems del menú por defecto (ayuda/sobre/bug)
+    menu_items={"Get Help": None, "Report a bug": None, "About": None},
+)
+
 st.title("📡 Mi Comparador Telecom")
 
 # =================== Utilidades base ===================
@@ -58,8 +62,31 @@ def run_async(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
+# ============== Toggle Dev: ocultar/mostrar toolbar & co. ============
+def apply_chrome_visibility(dev_mode: bool):
+    if dev_mode:
+        return  # mostrar toolbar/iconos
+    # Ocultar toolbar, menú, footer, botones header (Share, GitHub, etc.)
+    st.markdown(
+        """
+        <style>
+        /* Oculta la barra superior y menús */
+        div[data-testid="stToolbar"] { display: none !important; }
+        #MainMenu { visibility: hidden; }
+        header { visibility: hidden; }
+        footer { visibility: hidden; }
+        /* Botones de header (p. ej. "Share") */
+        button[kind="header"] { display: none !important; }
+        /* Enlaces con GitHub en top-right (por si existieran) */
+        a[href*="github.com"] { display: none !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # =================== Parsers / Regex comunes ===================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
+NEGATIVE_RE = re.compile(r"empresa|empresas|corporativ|pyme|emprendedor|convenio", re.IGNORECASE)
 
 # ---- Parser robusto de velocidad ----
 # Soporta: "600 Mb/s", "600 Mbps", "600 Mb", "600 Mega(s)", "1 Giga", "1 Gb", "1.5 Gbps", "hasta 940 Mbps"
@@ -194,18 +221,22 @@ def infer_mobile_detail(plan: str) -> str:
         return "1000 GB"
     return ""
 
-# =================== EXTRACTOR: incluye speed_hint desde CONTEXTO ===================
-def extract_plans_via_regex(html: str, max_items: int = 24) -> List[Tuple[str, str, int, str]]:
+# =================== EXTRACTOR con speed_hint (ventana ±1200) ===================
+def extract_plans_via_regex(html: str, max_items: int = 24, ctx_window: int = 1200) -> List[Tuple[str, str, int, str]]:
     results: List[Tuple[str, str, int, str]] = []
     for m in PRICE_RE.finditer(html):
-        start = max(m.start() - 320, 0)
-        end = min(m.end() + 320, len(html))
+        start = max(m.start() - ctx_window, 0)
+        end = min(m.end() + ctx_window, len(html))
         ctx = html[start:end]
 
+        # descarta contextos de Empresa/Corporativo/Convenios
+        if NEGATIVE_RE.search(ctx):
+            continue
+
         plan_match = (
-            re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,140})", ctx, re.IGNORECASE)
+            re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,180})", ctx, re.IGNORECASE)
             or re.search(r"((?:Internet\s*)?Fibra\s*(?:Gamer|Giga|[0-9]{2,4})\s*(?:Megas?|Mb|Mbps|Gigas?)?)", ctx, re.IGNORECASE)
-            or re.search(r"((?:Fibra|Internet)\s*[0-9]{2,4}\s*(?:Mb|Mbps))", ctx, re.IGNORECASE)
+            or re.search(r"((?:Fibra|Internet)\s*[0-9]{2,4}\s*(?:Mb|Mbps|Megas?))", ctx, re.IGNORECASE)
             or re.search(r"(TV\s*(?:Lite\+|Full\+|Online)?)", ctx, re.IGNORECASE)
             or re.search(r"(Telefon(?:ía|ia)\s*fija)", ctx, re.IGNORECASE)
         )
@@ -218,14 +249,13 @@ def extract_plans_via_regex(html: str, max_items: int = 24) -> List[Tuple[str, s
         price_str = m.group(0)
         price_int = clp_to_int(price_str)
 
-        if plan_name and price_int > 0:
-            results.append((plan_name, price_str, price_int, speed_hint))
-        elif price_int > 0:
-            results.append(("", price_str, price_int, speed_hint))
+        if price_int > 0:
+            results.append((plan_name or "", price_str, price_int, speed_hint))
 
         if len(results) >= max_items:
             break
 
+    # Dedup por (nombre, precio, speed_hint)
     seen = set()
     dedup: List[Tuple[str, str, int, str]] = []
     for p in results:
@@ -258,7 +288,7 @@ def rut_sin_formato(rut: str) -> str:
     if not rut:
         return ""
     r = unicodedata.normalize("NFKC", rut).strip()
-    r = re.sub(r"[^0-9Kk]", "", r)  # deja solo dígitos y K/k
+    r = re.sub(r"[^0-9Kk]", "", r)
     if not r:
         return ""
     if len(r) >= 2 and RUT_DV_RE.search(r[-1:]):
@@ -353,7 +383,6 @@ def normalizar_direccion_por_latlon(lat: str, lon: str) -> Optional[Dict]:
         return None
     return r.json()
 
-# === TU VALIDACIÓN (forward search → reverse) ===
 def on_dir_change_autovalidate():
     """
     Valida y normaliza dirección automáticamente al cambiar el input:
@@ -367,14 +396,12 @@ def on_dir_change_autovalidate():
         return
 
     try:
-        # 1) forward search (gratis) con límites/headers adecuados
         sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)  # 1.05s de pausa interna
         st.session_state["dir_sugerencias"] = sug or []
         if not sug:
             st.session_state["dir_status"] = "❌ No se encontró la dirección"
             return
 
-        # 2) toma la mejor coincidencia (primera) y normaliza por reverse
         best = sug[0]
         lat, lon = best.get("lat"), best.get("lon")
         if not (lat and lon):
@@ -392,6 +419,10 @@ def on_dir_change_autovalidate():
 
 # =================== Scraping helper (Playwright) ===================
 async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, str, int, str]]:
+    """
+    - Solo deja pasar planes cuyo NOMBRE case con `filters_regex` (fibra/mbps/mega/giga) o que tengan speed_hint.
+    - Descarta contextos de Empresa/Corporativo/Convenios.
+    """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         try:
@@ -410,20 +441,25 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
                     await page.goto(u, wait_until="domcontentloaded", timeout=30000)
                     try:
                         await page.wait_for_load_state("networkidle", timeout=12000)
-                        await page.mouse.wheel(0, 2200)
-                        await page.wait_for_timeout(700)
+                        await page.mouse.wheel(0, 2600)
+                        await page.wait_for_timeout(800)
                     except:
                         pass
                     html = await page.content()
-                    found = extract_plans_via_regex(html, max_items=24)
+                    found = extract_plans_via_regex(html, max_items=32, ctx_window=1200)
                     kept = []
-                    for f in found:
-                        plan_name, _, _, speed_hint = f
-                        if (plan_name and re.search(filters_regex, plan_name, re.IGNORECASE)) or speed_hint:
-                            kept.append(f)
+                    for plan_name, price_str, price_int, speed_hint in found:
+                        ctx_ok = bool(speed_hint) or (plan_name and re.search(filters_regex, plan_name, re.IGNORECASE))
+                        if not ctx_ok:
+                            continue
+                        # filtro negativo adicional sobre el nombre
+                        if plan_name and NEGATIVE_RE.search(plan_name):
+                            continue
+                        kept.append((plan_name, price_str, price_int, speed_hint))
                     results.extend(kept)
                 except Exception:
                     continue
+            # Dedup simple
             seen, dedup = set(), []
             for plan, ps, pi, sh in results:
                 k = (plan.lower(), pi, sh.lower() if sh else "")
@@ -434,7 +470,7 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
         finally:
             await browser.close()
 
-# =================== Scrapers HOGAR (solo URLs residenciales) ===================
+# =================== Scrapers HOGAR (URLs residenciales) ===================
 async def hogar_mundo() -> List[Dict]:
     urls = [
         "https://www.tumundo.cl/",
@@ -443,7 +479,8 @@ async def hogar_mundo() -> List[Dict]:
         "https://www.tumundo.cl/planes-hogar/fibra-1g-mundo-go/",
         "https://www.tumundo.cl/planes-hogar/fibra-10g/",
     ]
-    found = await _scrape_urls(urls, r"fibra|internet|tv|televisi[oó]n|telefon")
+    # usaremos patrones de fibra/velocidad, no “internet” genérico
+    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
@@ -470,7 +507,7 @@ async def hogar_movistar() -> List[Dict]:
         "https://ww2.movistar.cl/hogar/arma-tu-plan/",
         "https://ww2.movistar.cl/hogar/pack-duos-internet-television/",
     ]
-    found = await _scrape_urls(urls, r"fibra|internet|tv|televisi[oó]n|telefon")
+    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
@@ -495,7 +532,7 @@ async def hogar_entel() -> List[Dict]:
         "https://www.entel.cl/hogar/internet",
         "https://www.entel.cl/hogar/fibra-optica",
     ]
-    found = await _scrape_urls(urls, r"fibra|internet|tv|televisi[oó]n|telefon")
+    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
@@ -521,7 +558,7 @@ async def hogar_wom() -> List[Dict]:
         "https://store.wom.cl/hogar/internet-tv-hogar",
         "https://store.wom.cl/fibra/",
     ]
-    found = await _scrape_urls(urls, r"fibra|internet|tv|televisi[oó]n|telefon")
+    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
@@ -548,7 +585,7 @@ async def hogar_vtr() -> List[Dict]:
         "https://www.nuevo.vtr.com/comparador-planes",
         "https://vtr.com/productos/hogar-packs/internet-hogar/",
     ]
-    found = await _scrape_urls(urls, r"fibra|internet|tv|televisi[oó]n|telefon")
+    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
@@ -645,6 +682,10 @@ def _limpiar_filtros():
 # =================== Sidebar: RUT + Dirección + Proveedores + Modo ===================
 with st.sidebar:
     st.header("Datos del cliente")
+
+    # Toggle Dev
+    st.checkbox("Modo desarrollador (mostrar toolbar)", value=False, key="dev_mode")
+    apply_chrome_visibility(st.session_state.get("dev_mode", False))
 
     st.text_input(
         "RUT (autoformato y validación)",
@@ -758,18 +799,14 @@ if st.session_state.get("modo_busqueda") == "Hogar":
 
                 # >>> INSIGNIA + DEDUP HOGAR
                 if not df.empty:
-                    # Inicializa columna insignia
                     df["insignia"] = ""
-                    # Marca como "Oferta más barata" al mínimo Precio_CLP por (__prov, velocidad, pack)
                     if "Precio_CLP" in df.columns:
                         grp = ["__prov", "velocidad", "pack seleccionado"]
                         idx_min = df.groupby(grp, dropna=False)["Precio_CLP"].idxmin()
                         df.loc[idx_min, "insignia"] = "🏷️ Oferta más barata"
-                        # Ordena por precio y dedup por grupo, quedando la ganadora
                         df = df.sort_values(by="Precio_CLP", na_position="last")
                         df = df.loc[~df.duplicated(subset=grp, keep="first")].copy()
                     else:
-                        # Si no hay Precio_CLP por alguna razón, al menos dedup por grupo
                         df = df.loc[~df.duplicated(subset=["__prov","velocidad","pack seleccionado"], keep="first")].copy()
 
                 if df.empty:
@@ -777,7 +814,6 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                 else:
                     if "Precio_CLP" in df.columns:
                         df = df.sort_values(by="Precio_CLP", na_position="last")
-                    # Asegura todas las columnas de salida
                     for c in cols_final:
                         if c not in df.columns:
                             df[c] = ""
@@ -834,13 +870,15 @@ else:
                                     "costo total": format_clp(total),
                                     "Precio_CLP": total,
                                     "__prov": prov,
+                                    "insignia": ""
                                 })
                     if combos:
                         dfm = pd.concat([dfm, pd.DataFrame(combos)], ignore_index=True)
 
                 # >>> INSIGNIA + DEDUP MÓVIL
                 if not dfm.empty:
-                    dfm["insignia"] = ""
+                    if "insignia" not in dfm.columns:
+                        dfm["insignia"] = ""
                     if "Precio_CLP" in dfm.columns:
                         grp_m = ["__prov", "pack seleccionado", "detalle movil"]
                         idx_min_m = dfm.groupby(grp_m, dropna=False)["Precio_CLP"].idxmin()
