@@ -571,8 +571,10 @@ if st.session_state.get("modo_busqueda") == "Hogar":
             "fibra + tv", "fibra + telefonía", "fibra + móvil",
             "fibra + tv + telefonía", "fibra + tv/telefonía",
         ],
-        default=st.session_state.get("servicios_sel_hogar", ["solo internet", "f
-ibra + tv", "fibra + telefonía", "fibra + móvil"]),
+        default=st.session_state.get(
+            "servicios_sel_hogar",
+            ["solo internet", "fibra + tv", "fibra + telefonía", "fibra + móvil"]
+        ),
         key="servicios_sel_hogar"
     )
 else:
