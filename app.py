@@ -1,3 +1,12 @@
+# app.py
+# Comparador Telecom Chile - Hogar/Móvil
+# - RUT: autoformato + validación (módulo-11) al escribir
+# - Dirección: validación/normalización automática con Nominatim (≤1 req/s)
+# - Modo exclusivo: Hogar o Móvil
+# - Scrapers: Mundo / Movistar / Entel / WOM (+ VTR fallback) para Hogar; Movistar/Entel/WOM para Móvil
+# - Botón "Limpiar filtros" (restaura defaults y limpia cachés)
+# - NUEVO: velocidad (Mbps/Gbps) también se extrae desde el CONTEXTO HTML (speed_hint)
+
 import os
 import re
 import sys
@@ -5,7 +14,7 @@ import time
 import json
 import asyncio
 import subprocess
-from typing import List, Dict, Tuple, Optional  # <-- FIX: añadí Optional
+from typing import List, Dict, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -18,9 +27,13 @@ st.set_page_config(page_title="Comparador Chile", page_icon="📡")
 st.title("📡 Mi Comparador Telecom")
 
 
-# =================== Utilidades ===================
+# =================== Utilidades base ===================
 @st.cache_resource(show_spinner=False)
 def ensure_chromium_installed():
+    """
+    Descarga Chromium SOLO una vez por sesión.
+    Evita '--with-deps' (no hay sudo) para Streamlit Cloud.
+    """
     os.environ.setdefault(
         "PLAYWRIGHT_BROWSERS_PATH",
         os.path.expanduser("~/.cache/ms-playwright")
@@ -40,7 +53,7 @@ def ensure_chromium_installed():
 
 
 def run_async(coro):
-    """Ejecuta corrutina de forma segura (sirve si el loop ya está corriendo)."""
+    """Ejecuta corrutina de forma segura, incluso si ya existe event loop."""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -57,7 +70,7 @@ def run_async(coro):
         return asyncio.run(coro)
 
 
-# ======= Heurísticas / Regex =======
+# =================== Heurísticas / Regex ===================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
 
 def clp_to_int(texto: str) -> int:
@@ -70,27 +83,35 @@ def format_clp(valor: int) -> str:
     return f"${valor:,.0f}".replace(",", ".") if valor >= 0 else ""
 
 def infer_speed(plan: str) -> str:
+    """Devuelve '600 Mbps', '1 Gbps', etc., si detecta en el nombre del plan."""
     if not plan:
         return ""
     txt = plan.lower()
+
     m_gigas = re.search(r"(\d+)\s*giga?s?", txt)
     if m_gigas:
         val = int(m_gigas.group(1))
         return f"{val} Gbps" if val != 1 else "1 Gbps"
+
     m_gbps = re.search(r"\b(10000|5000|3000|2000|1000)\b", txt)
     if m_gbps:
         v = int(m_gbps.group(1))
         return f"{v//1000} Gbps" if v % 1000 == 0 else f"{v} Mbps"
+
     if re.search(r"\b940\b", txt):
         return "940 Mbps"
-    m_mbps = re.search(r"\b(150|300|400|500|560|600|700|800|900)\b", txt)
+
+    m_mbps = re.search(r"\b(150|200|300|400|500|560|600|700|800|900)\b", txt)
     if m_mbps:
         return f"{m_mbps.group(1)} Mbps"
+
     if "gamer" in txt and "940" not in txt:
         return "940 Mbps"
+
     return ""
 
 def infer_pack(plan: str) -> str:
+    """Clasificación simple de pack a partir del texto del plan."""
     if not plan:
         return "Solo Fibra"
     t = plan.lower()
@@ -104,20 +125,29 @@ def infer_pack(plan: str) -> str:
         return "Fibra + TV/Telefonía"
     return "Solo Fibra"
 
-def infer_service_type(plan: str, force_mobile: bool=False) -> str:
+def infer_service_type(plan: str, force_mobile: bool = False) -> str:
+    """
+    Tipos:
+      - Individuales: 'solo tv', 'solo internet', 'solo internet móvil', 'solo telefonía móvil', 'solo telefonía fija'
+      - Packs: 'fibra + tv', 'fibra + telefonía', 'fibra + móvil', 'fibra + tv + telefonía', 'fibra + tv/telefonía'
+    """
     if force_mobile:
         return "solo internet móvil"
     if not plan:
         return "solo internet"
     t = plan.lower()
+
     if ("móvil" in t or "movil" in t) and ("fibra" not in t and "internet" not in t and "tv" not in t):
         if "gigas" in t or "gb" in t:
             return "solo internet móvil"
         return "solo telefonía móvil"
+
     if ("telef" in t or "fija" in t) and ("fibra" not in t and "internet" not in t and "tv" not in t):
         return "solo telefonía fija"
+
     if ("tv" in t or "zapping" in t or "mundo go" in t) and ("fibra" not in t and "internet" not in t):
         return "solo tv"
+
     pack = infer_pack(plan)
     mapping = {
         "Solo Fibra": "solo internet",
@@ -129,6 +159,7 @@ def infer_service_type(plan: str, force_mobile: bool=False) -> str:
     return mapping.get(pack, "solo internet")
 
 def infer_mobile_detail(plan: str) -> str:
+    """Devuelve 'Gigas Libres' o '<n> GB' si está presente en el nombre del plan."""
     if not plan:
         return ""
     t = plan.lower()
@@ -142,50 +173,101 @@ def infer_mobile_detail(plan: str) -> str:
         return "1000 GB"
     return ""
 
-def extract_plans_via_regex(html: str, max_items: int = 24) -> List[Tuple[str, str, int]]:
-    results: List[Tuple[str, str, int]] = []
+
+# =================== EXTRACTOR con pista de velocidad (speed_hint) ===================
+def extract_plans_via_regex(html: str, max_items: int = 24) -> List[Tuple[str, str, int, str]]:
+    """
+    Heurística: detecta precios CLP y, en una ventana cercana, intenta:
+      - Nombre del plan (plan_name)
+      - Pista de velocidad (speed_hint) incluso si no aparece en el nombre
+    Retorna lista de (plan_name, price_str, price_int, speed_hint)
+    """
+    results: List[Tuple[str, str, int, str]] = []
+
     for m in PRICE_RE.finditer(html):
         start = max(m.start() - 260, 0)
         end = min(m.end() + 260, len(html))
         ctx = html[start:end]
+
+        # Nombre cercano
         plan_match = (
             re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,120})", ctx, re.IGNORECASE)
-            or re.search(r"((?:Internet\s*)?Fibra\s*(?:Gamer|Giga|[0-9]{2,4})\s*(?:Megas?|Mb|Mbps|Gigas?)?)", ctx, re.IGNORECASE)
+            or re.search(r"((?:Internet\s*)?Fibra\s*(?:Gamer|Giga|[0-9]{2,4})\s*(?:Megas?|Mb|Mbps|Gigas?)?)",
+                         ctx, re.IGNORECASE)
             or re.search(r"((?:Fibra|Internet)\s*[0-9]{2,4}\s*(?:Mb|Mbps))", ctx, re.IGNORECASE)
             or re.search(r"(5G\s*Libre\s*(?:Full|Pro|Ultra)?\s*\d{0,4}\s*GB?)", ctx, re.IGNORECASE)
             or re.search(r"(Plan\s*(?:\d{2,4}|Gigas\s*Libres).{0,40})", ctx, re.IGNORECASE)
             or re.search(r"(TV\s*(?:Lite\+|Full\+|Online)?)", ctx, re.IGNORECASE)
             or re.search(r"(Telefon(?:ía|ia)\s*fija)", ctx, re.IGNORECASE)
         )
+
         plan_name = None
         if plan_match:
             plan_name = re.sub(r"\s+", " ", plan_match.group(1)).strip()
             plan_name = re.sub(r"(POR\s+\d+\s+MESES|SOLO\s+FIBRA|HASTA|OFERTA\s+WEB).*$",
                                "", plan_name, flags=re.IGNORECASE).strip(" -–:|.")
+
+        # Pista de velocidad desde el contexto (aunque no esté en el nombre)
+        speed_hint = ""
+        # 1) 'X Giga / Gigas' -> Gbps
+        m_giga = re.search(r"\b(\d{1,2})\s*giga?s?\b", ctx, re.IGNORECASE)
+        if m_giga:
+            val = int(m_giga.group(1))
+            speed_hint = f"{val} Gbps" if val != 1 else "1 Gbps"
+        else:
+            # 2) 'X Mb/Mbps/Megas' (incluye 940, 1000, 2000, 3000, 5000, 10000)
+            m_mbps = re.search(
+                r"\b(150|200|300|400|500|560|600|700|800|900|940|1000|1500|2000|3000|5000|10000)\s*(?:mbps|mb|megas?)\b",
+                ctx, re.IGNORECASE
+            )
+            if m_mbps:
+                num = int(m_mbps.group(1))
+                if num in (1000, 1500, 2000, 3000, 5000, 10000):
+                    speed_hint = f"{num//1000} Gbps" if num % 1000 == 0 else f"{num} Mbps"
+                else:
+                    speed_hint = f"{num} Mbps"
+            else:
+                # 3) casos especiales “Gamer” → comúnmente 940
+                if re.search(r"gamer", ctx, re.IGNORECASE):
+                    speed_hint = "940 Mbps"
+
         price_str = m.group(0)
         price_int = clp_to_int(price_str)
+
         if plan_name and price_int > 0:
-            results.append((plan_name, price_str, price_int))
+            results.append((plan_name, price_str, price_int, speed_hint))
+        elif price_int > 0:
+            # A falta de nombre, guarda con speed_hint si existe
+            results.append(("", price_str, price_int, speed_hint))
+
         if len(results) >= max_items:
             break
+
+    # Dedup por (nombre.lower(), precio_int, speed_hint) (para no perder velocidades)
     seen = set()
-    dedup = []
+    dedup: List[Tuple[str, str, int, str]] = []
     for p in results:
-        key = (p[0].lower(), p[2])
+        key = (p[0].lower(), p[2], p[3].lower() if p[3] else "")
         if key not in seen:
             seen.add(key)
             dedup.append(p)
     return dedup
 
 
-# =================== RUT: Formato + Validación (módulo 11) ===================
+# =================== RUT (autoformato + validación) ===================
 def rut_sin_formato(rut: str) -> str:
+    """Elimina puntos/guion y normaliza K mayúscula."""
     if not rut:
         return ""
     rut = rut.strip().replace(".", "").replace("-", "").replace(" ", "")
     return rut[:-1] + rut[-1].upper() if rut else ""
 
 def calcular_dv(rut_cuerpo: str) -> str:
+    """
+    Algoritmo módulo 11:
+      - Serie repetitiva 2..7 sobre dígitos (derecha->izquierda)
+      - dv = 11 - (suma % 11); si dv=11 -> 0; si dv=10 -> K
+    """
     if not rut_cuerpo.isdigit():
         return ""
     factores = [2, 3, 4, 5, 6, 7]
@@ -201,6 +283,7 @@ def calcular_dv(rut_cuerpo: str) -> str:
     return str(dv)
 
 def formatear_rut(rut: str) -> str:
+    """Devuelve RUT como 12.345.678-K."""
     rut = rut_sin_formato(rut)
     if len(rut) < 2:
         return rut
@@ -212,6 +295,7 @@ def formatear_rut(rut: str) -> str:
     return f"{cuerpo_fmt}-{dv}"
 
 def validar_rut(rut: str) -> bool:
+    """Valida formato y dígito verificador."""
     limpio = rut_sin_formato(rut)
     if len(limpio) < 2:
         return False
@@ -228,28 +312,91 @@ def _nominatim_headers():
     return {"User-Agent": "MiComparadorTelecom/1.0 (Streamlit; contacto: soporte@ejemplo.cl)"}
 
 def buscar_direccion_gratis(q: str, countrycodes: str = "cl", limit: int = 5) -> List[Dict]:
+    """
+    Forward geocoding con Nominatim (gratis).
+    Respeta política: ≤1 req/seg y User-Agent propio.
+    """
     if not q:
         return []
     params = {"q": q, "format": "jsonv2", "addressdetails": 1, "limit": limit, "countrycodes": countrycodes}
-    time.sleep(1.05)  # Respetar 1 req/seg (política de uso)
+    time.sleep(1.05)  # 1 req/s
     r = requests.get(NOMINATIM_SEARCH, params=params, headers=_nominatim_headers(), timeout=20)
     if r.status_code != 200:
         return []
     return r.json()
 
 def normalizar_direccion_por_latlon(lat: str, lon: str) -> Optional[Dict]:
+    """Reverse geocoding para normalizar a 'display_name' canónico."""
     if not lat or not lon:
         return None
     params = {"lat": lat, "lon": lon, "format": "jsonv2", "addressdetails": 1, "zoom": 18, "accept-language": "es-CL"}
-    time.sleep(1.05)  # Respetar 1 req/seg
+    time.sleep(1.05)  # 1 req/s
     r = requests.get(NOMINATIM_REVERSE, params=params, headers=_nominatim_headers(), timeout=20)
     if r.status_code != 200:
         return None
     return r.json()
 
 
-# =================== Scraping helpers ===================
-async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, str, int]]:
+# =================== Callbacks automáticos (RUT y Dirección) ===================
+def on_rut_change_autofmt():
+    """Formatea el RUT con puntos/guion y valida al cambiar el input."""
+    raw = st.session_state.get("rut_raw", "")
+    limpio = rut_sin_formato(raw)
+    if not limpio:
+        st.session_state["rut_formateado"] = ""
+        st.session_state["rut_valido"] = False
+        st.session_state["rut_status"] = "Ingrese su RUT"
+        return
+
+    # Si usuario ingresa solo dígitos (7-8), autocompleta DV
+    if limpio.isdigit() and 7 <= len(limpio) <= 8:
+        dv = calcular_dv(limpio)
+        limpio = limpio + dv
+
+    fmt = formatear_rut(limpio)
+    st.session_state["rut_raw"] = fmt  # auto-escribe en el mismo campo
+    es_ok = validar_rut(fmt)
+    st.session_state["rut_formateado"] = fmt
+    st.session_state["rut_valido"] = es_ok
+    st.session_state["rut_status"] = "✅ RUT válido" if es_ok else "❌ RUT inválido"
+
+def on_dir_change_autovalidate():
+    """
+    Valida/normaliza dirección automáticamente:
+      - forward search (q) -> mejor match
+      - reverse -> display_name canónico en el input
+    """
+    q = (st.session_state.get("dir_input") or "").strip()
+    if len(q) < 5:
+        st.session_state["dir_sugerencias"] = []
+        st.session_state["dir_status"] = "Escriba una dirección más específica"
+        return
+
+    try:
+        sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)  # 1.05s dentro
+        st.session_state["dir_sugerencias"] = sug or []
+        if not sug:
+            st.session_state["dir_status"] = "❌ No se encontró la dirección"
+            return
+
+        best = sug[0]
+        lat, lon = best.get("lat"), best.get("lon")
+        if not (lat and lon):
+            st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"
+            return
+
+        rev = normalizar_direccion_por_latlon(lat, lon)  # 1.05s dentro
+        if rev and "display_name" in rev:
+            st.session_state["dir_input"] = rev["display_name"]  # auto-normaliza
+            st.session_state["dir_status"] = "✅ Dirección validada y normalizada"
+        else:
+            st.session_state["dir_status"] = "❌ No se pudo normalizar (reverse)"
+    except Exception:
+        st.session_state["dir_status"] = "⚠️ Error validando con Nominatim"
+
+
+# =================== Scraping helper (Playwright) ===================
+async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, str, int, str]]:
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         try:
@@ -262,7 +409,7 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
                 extra_http_headers={"Accept-Language": "es-CL,es;q=0.9,en;q=0.8"},
             )
             page = await ctx.new_page()
-            results: List[Tuple[str, str, int]] = []
+            results: List[Tuple[str, str, int, str]] = []
             for u in urls:
                 try:
                     await page.goto(u, wait_until="domcontentloaded", timeout=30000)
@@ -278,10 +425,10 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
                     results.extend(found)
                 except Exception:
                     continue
-            # dedup
+            # Dedup (ya viene deduplicado desde extractor, pero por seguridad)
             seen, dedup = set(), []
             for plan in results:
-                k = (plan[0].lower(), plan[2])
+                k = (plan[0].lower(), plan[2], plan[3].lower() if plan[3] else "")
                 if k not in seen:
                     seen.add(k)
                     dedup.append(plan)
@@ -295,18 +442,21 @@ async def hogar_mundo() -> List[Dict]:
     urls = ["https://mundointernet.cl/p/td/mundo-internet-planes.html", "https://www.tumundo.cl/"]
     found = await _scrape_urls(urls, r"fibra|internet|tv|telefon")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
-        if tipo not in {"solo tv","solo internet","solo telefonía fija","fibra + tv","fibra + telefonía","fibra + móvil","fibra + tv + telefonía","fibra + tv/telefonía"}:
+        if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
+                        "fibra + tv", "fibra + telefonía", "fibra + móvil",
+                        "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
+        velocidad = infer_speed(plan) or speed_hint
         out.append({
-            "mundo":"✔","movistar":"","entel":"","wom":"","vtr":"",
+            "mundo": "✔", "movistar": "", "entel": "", "wom": "", "vtr": "",
             "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": infer_speed(plan),
+            "velocidad": velocidad,
             "detalle movil": infer_mobile_detail(plan),
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"mundo","__plan":plan
+            "__prov": "mundo", "__plan": plan
         })
     return out
 
@@ -319,18 +469,21 @@ async def hogar_movistar() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|internet|tv|telefon")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
-        if tipo not in {"solo tv","solo internet","solo telefonía fija","fibra + tv","fibra + telefonía","fibra + móvil","fibra + tv + telefonía","fibra + tv/telefonía"}:
+        if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
+                        "fibra + tv", "fibra + telefonía", "fibra + móvil",
+                        "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
+        velocidad = infer_speed(plan) or speed_hint
         out.append({
-            "mundo":"","movistar":"✔","entel":"","wom":"","vtr":"",
+            "mundo": "", "movistar": "✔", "entel": "", "wom": "", "vtr": "",
             "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": infer_speed(plan),
+            "velocidad": velocidad,
             "detalle movil": infer_mobile_detail(plan),
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"movistar","__plan":plan
+            "__prov": "movistar", "__plan": plan
         })
     return out
 
@@ -343,18 +496,21 @@ async def hogar_entel() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|internet|tv|pack|telefon")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
-        if tipo not in {"solo tv","solo internet","solo telefonía fija","fibra + tv","fibra + telefonía","fibra + móvil","fibra + tv + telefonía","fibra + tv/telefonía"}:
+        if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
+                        "fibra + tv", "fibra + telefonía", "fibra + móvil",
+                        "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
+        velocidad = infer_speed(plan) or speed_hint
         out.append({
-            "mundo":"","movistar":"","entel":"✔","wom":"","vtr":"",
+            "mundo": "", "movistar": "", "entel": "✔", "wom": "", "vtr": "",
             "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": infer_speed(plan),
+            "velocidad": velocidad,
             "detalle movil": infer_mobile_detail(plan),
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"entel","__plan":plan
+            "__prov": "entel", "__plan": plan
         })
     return out
 
@@ -367,18 +523,21 @@ async def hogar_wom() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|internet|tv|zapping|telefon")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
-        if tipo not in {"solo tv","solo internet","solo telefonía fija","fibra + tv","fibra + telefonía","fibra + móvil","fibra + tv + telefonía","fibra + tv/telefonía"}:
+        if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
+                        "fibra + tv", "fibra + telefonía", "fibra + móvil",
+                        "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
+        velocidad = infer_speed(plan) or speed_hint
         out.append({
-            "mundo":"","movistar":"","entel":"","wom":"✔","vtr":"",
+            "mundo": "", "movistar": "", "entel": "", "wom": "✔", "vtr": "",
             "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": infer_speed(plan),
+            "velocidad": velocidad,
             "detalle movil": infer_mobile_detail(plan),
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"wom","__plan":plan
+            "__prov": "wom", "__plan": plan
         })
     return out
 
@@ -391,18 +550,21 @@ async def hogar_vtr() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|internet|tv|telefon")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, speed_hint in found:
         tipo = infer_service_type(plan)
-        if tipo not in {"solo tv","solo internet","solo telefonía fija","fibra + tv","fibra + telefonía","fibra + móvil","fibra + tv + telefonía","fibra + tv/telefonía"}:
+        if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
+                        "fibra + tv", "fibra + telefonía", "fibra + móvil",
+                        "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
+        velocidad = infer_speed(plan) or speed_hint
         out.append({
-            "mundo":"","movistar":"","entel":"","wom":"","vtr":"✔",
+            "mundo": "", "movistar": "", "entel": "", "wom": "", "vtr": "✔",
             "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": infer_speed(plan),
+            "velocidad": velocidad,
             "detalle movil": infer_mobile_detail(plan),
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"vtr","__plan":plan
+            "__prov": "vtr", "__plan": plan
         })
     return out
 
@@ -416,15 +578,15 @@ async def movistar_movil() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"5g|plan|gb|gigas|móvil|movil")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, _speed_hint in found:
         out.append({
-            "mundo":"","movistar":"✔","entel":"","wom":"","vtr":"",
-            "pack seleccionado":"solo internet móvil",
-            "velocidad":"",
+            "mundo": "", "movistar": "✔", "entel": "", "wom": "", "vtr": "",
+            "pack seleccionado": "solo internet móvil",
+            "velocidad": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"movistar","__plan":plan
+            "__prov": "movistar", "__plan": plan
         })
     return out
 
@@ -437,15 +599,15 @@ async def entel_movil() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"plan|5g|gigas|gb|internet móvil|movil")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, _speed_hint in found:
         out.append({
-            "mundo":"","movistar":"","entel":"✔","wom":"","vtr":"",
-            "pack seleccionado":"solo internet móvil",
-            "velocidad":"",
+            "mundo": "", "movistar": "", "entel": "✔", "wom": "", "vtr": "",
+            "pack seleccionado": "solo internet móvil",
+            "velocidad": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"entel","__plan":plan
+            "__prov": "entel", "__plan": plan
         })
     return out
 
@@ -457,97 +619,67 @@ async def wom_movil() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"plan|gigas|gb|5g")
     out: List[Dict] = []
-    for plan, price_str, price_int in found:
+    for plan, price_str, price_int, _speed_hint in found:
         out.append({
-            "mundo":"","movistar":"","entel":"","wom":"✔","vtr":"",
-            "pack seleccionado":"solo internet móvil",
-            "velocidad":"",
+            "mundo": "", "movistar": "", "entel": "", "wom": "✔", "vtr": "",
+            "pack seleccionado": "solo internet móvil",
+            "velocidad": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
             "costo total": format_clp(price_int) or price_str,
             "Precio_CLP": price_int,
-            "__prov":"wom","__plan":plan
+            "__prov": "wom", "__plan": plan
         })
     return out
 
 
-# =================== Sidebar: RUT + Dirección + Proveedores + Modo ===================
-def _rut_on_change():
-    raw = st.session_state.get("rut_raw", "")
-    limpio = rut_sin_formato(raw)
-    if not limpio:
-        st.session_state["rut_formateado"] = ""
-        st.session_state["rut_valido"] = False
-        return
-    fmt = formatear_rut(limpio)
-    st.session_state["rut_formateado"] = fmt
-    st.session_state["rut_valido"] = validar_rut(fmt)
-
+# =================== Limpieza de filtros ===================
 def _limpiar_filtros():
-    # proveedores por defecto
+    # Proveedores (defaults)
     st.session_state["incluir_mundo"] = True
     st.session_state["incluir_movistar"] = True
     st.session_state["incluir_entel"] = True
     st.session_state["incluir_wom"] = True
     st.session_state["incluir_vtr"] = False
-    # servicios/packs por defecto de ambos modos
+    # Servicios/packs (defaults)
     st.session_state["servicios_sel_hogar"] = ["solo internet", "fibra + tv", "fibra + telefonía", "fibra + móvil"]
     st.session_state["servicios_sel_movil"] = ["solo internet móvil"]
-    # limpiar cachés
+    # Cachés
     st.session_state["fibra_por_proveedor"] = {}
     st.toast("Filtros restablecidos")
 
+
+# =================== Sidebar: RUT + Dirección + Proveedores + Modo ===================
 with st.sidebar:
     st.header("Datos del cliente")
 
-    st.text_input("RUT (formato automático)", key="rut_raw", on_change=_rut_on_change, placeholder="12.345.678-K")
-    rut_fmt = st.session_state.get("rut_formateado", "")
-    rut_ok = st.session_state.get("rut_valido", False)
-    if rut_fmt:
-        st.caption(f"🔎 RUT normalizado: **{rut_fmt}**  —  {'✅ Válido' if rut_ok else '❌ No válido'}")
+    # --- RUT autoformato/validación ---
+    st.text_input(
+        "RUT (autoformato y validación)",
+        key="rut_raw",
+        placeholder="12.345.678-K",
+        on_change=on_rut_change_autofmt
+    )
+    st.caption(st.session_state.get("rut_status", "Ingrese su RUT"))
 
-    st.text_input("Dirección (libre)", key="dir_input", placeholder="calle y número, comuna")
+    # --- Dirección autovalidación/normalización ---
+    st.text_input(
+        "Dirección (auto-validación y normalización)",
+        key="dir_input",
+        placeholder="calle y número, comuna",
+        on_change=on_dir_change_autovalidate
+    )
+    st.caption(st.session_state.get("dir_status", "Escribe una dirección y presiona Enter"))
 
-    col_b1, col_b2, col_b3 = st.columns([1,1,1])
-    with col_b1:
-        if st.button("🔎 Buscar dirección (gratis)"):
-            query = st.session_state.get("dir_input", "")
-            try:
-                sugerencias = buscar_direccion_gratis(query, countrycodes="cl", limit=5)
-            except Exception:
-                sugerencias = []
-            st.session_state["dir_sugerencias"] = sugerencias or []
-            if sugerencias:
-                st.session_state["dir_choice_idx"] = 0
-    with col_b2:
-        if st.button("🧭 Normalizar dirección"):
-            sugerencias = st.session_state.get("dir_sugerencias", [])
-            idx = st.session_state.get("dir_choice_idx", 0)
-            if sugerencias:
-                lat, lon = sugerencias[idx].get("lat"), sugerencias[idx].get("lon")
-            else:
-                q = st.session_state.get("dir_input", "")
-                primer = (buscar_direccion_gratis(q, "cl", 1) or [None])[0]
-                lat, lon = (primer or {}).get("lat"), (primer or {}).get("lon")
-            if lat and lon:
-                rev = normalizar_direccion_por_latlon(lat, lon)
-                if rev and "display_name" in rev:
-                    st.session_state["dir_input"] = rev["display_name"]
-                    st.success("Dirección normalizada")
-            else:
-                st.info("Primero realiza una búsqueda de dirección.")
-    with col_b3:
-        if st.button("🧹 Limpiar dirección"):
-            st.session_state["dir_input"] = ""
-            st.session_state["dir_sugerencias"] = []
-            st.session_state["dir_choice_idx"] = 0
-
-    sug = st.session_state.get("dir_sugerencias", [])
+    # Diagnóstico breve (top-3 coincidencias)
+    sug = st.session_state.get("dir_sugerencias", []) or []
     if sug:
-        labels = [f'{s.get("display_name","")}' for s in sug]
-        st.selectbox("Resultados (Nominatim — 1 req/s máx.)", labels, index=st.session_state.get("dir_choice_idx", 0), key="dir_choice_idx")
-        st.caption("Fuente: OpenStreetMap Nominatim — uso libre con límites (1 req/s; User‑Agent propio).")
+        st.write("Coincidencias (top 3):")
+        for i, s in enumerate(sug[:3], start=1):
+            st.write(f"{i}. {s.get('display_name','')}")
 
     st.divider()
+
+    # Proveedores
     st.subheader("Compañías a comparar")
     st.checkbox("Mundo", value=True, key="incluir_mundo")
     st.checkbox("Movistar", value=True, key="incluir_movistar")
@@ -558,7 +690,7 @@ with st.sidebar:
     st.button("🧽 Limpiar filtros", on_click=_limpiar_filtros)
 
     st.divider()
-    modo = st.radio("¿Qué quieres comparar?", ["Hogar", "Móvil"], index=0, horizontal=True, key="modo_busqueda")
+    st.radio("¿Qué quieres comparar?", ["Hogar", "Móvil"], index=0, horizontal=True, key="modo_busqueda")
 
 
 # =================== Filtros según MODO ===================
@@ -611,7 +743,7 @@ if st.session_state.get("modo_busqueda") == "Hogar":
 
                 df = pd.DataFrame(resultados)
 
-                # Guardar “mejor fibra por proveedor” para combos posteriores (Fibra+Móvil)
+                # Guardar mejor fibra por proveedor (para combos Fibra+Móvil)
                 fibra_map = {}
                 if not df.empty:
                     tmp = df.copy()
@@ -713,6 +845,7 @@ else:
                             dfm[c] = ""
                     st.success("¡Planes móviles listos!")
                     st.dataframe(dfm[cols_final], use_container_width=True)
+
             except Exception as e:
                 st.error(f"Falla en la consulta Móvil: {e}")
                 st.caption("Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez.")
