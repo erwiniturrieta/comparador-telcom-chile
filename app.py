@@ -1,11 +1,14 @@
 # app.py
 # Comparador Telecom Chile - Hogar/Móvil
-# - RUT: autoformato + validación (módulo-11) al escribir (corrige punto fantasma; respeta ceros iniciales)
-# - Dirección: validación/normalización automática (forward search + reverse)
-# - Solo Hogar: listas blancas de URLs y filtro negativo (empresa/pyme/corporativo/convenios)
-# - Velocidad: extraída del nombre o del CONTEXTO HTML (ventana ±1200)
-# - DEDUP + INSIGNIA: marca "🏷️ Oferta más barata" y queda solo la ganadora
-# - Toggle "Modo desarrollador": oculta/mostrar toolbar, Share, GitHub, "Manage app", etc.
+# - RUT: autoformato + validación (módulo-11), sin "punto fantasma" y respeta ceros iniciales
+# - Dirección: forward search → reverse (Nominatim) con pausa ≤1 req/s
+# - Scraping Hogar: listas blancas por proveedor + filtro negativo anti-Empresas/Convenios
+# - Extracción robusta:
+#     * Velocidad (Mbps/Gbps) desde nombre o CONTEXTO (±1200)
+#     * Precio oferta (mensual), Periodo de oferta, Precio normal/luego
+#     * Instalación (monto) y "sin costo" cuando aplique
+# - DEDUP + Insignia: “🏷️ Oferta más barata” por (compañía, velocidad, pack)
+# - Toggle "Modo desarrollador": oculta/mostrar toolbar, "Manage app", etc.
 
 import os
 import re
@@ -69,7 +72,7 @@ def apply_chrome_visibility(dev_mode: bool):
     Cuando dev_mode=True (dev), no oculta nada.
     """
     if dev_mode:
-        return  # mostrar todo en modo desarrollador
+        return
 
     st.markdown(
         """
@@ -95,7 +98,7 @@ def apply_chrome_visibility(dev_mode: bool):
         div[aria-label="Main menu"] { display: none !important; }
         [data-testid="stActionButtonIcon"] { display: none !important; }
 
-        /* Fallback defensivo: contenedor que envuelve el botón */
+        /* Fallback defensivo */
         div:has(> a[title="Manage app"]),
         div:has(> button[title="Manage app"]) {
           display: none !important;
@@ -109,11 +112,29 @@ def apply_chrome_visibility(dev_mode: bool):
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
 NEGATIVE_RE = re.compile(r"empresa|empresas|corporativ|pyme|emprendedor|convenio", re.IGNORECASE)
 
-# ---- Parser robusto de velocidad ----
-# Soporta: "600 Mb/s", "600 Mbps", "600 Mb", "600 Mega(s)", "1 Giga", "1 Gb", "1.5 Gbps", "hasta 940 Mbps"
-GIGA_RE = re.compile(r"\b(\d+(?:[.,]\d+)?)\s*(?:g(?:ig?a)?|gb(?:ps)?)\b", re.IGNORECASE)
+# ---- Velocidad ----
+# Solo permitir 0–10 para Gbps (evita "600 Gbps")
+GIGA_RE = re.compile(r"\b(0?\d(?:[.,]\d+)?)\s*(?:g(?:ig?a)?|gb(?:ps)?)\b", re.IGNORECASE)
 MBPS_RE = re.compile(r"\b(\d{2,5})\s*(?:m(?:b(?:ps)?|b\/s)?|mega?s?)\b", re.IGNORECASE)
 HASTA_RE = re.compile(r"\bhasta\b\s+(\d+(?:[.,]\d+)?)\s*(?:mbps|mb\/s|mb|mega?s?|g(?:ig?a)?|gb(?:ps)?)", re.IGNORECASE)
+
+# ---- Contexto de precios ----
+MIN_MONTHLY_CLP = 7000  # umbral anti-ruido (descarta extensor $2.990, add-ons $1.990, etc.)
+MONTHLY_NEAR_RE = re.compile(
+    r"(al\s*mes|/mes|\bmes\b|mensual|por\s*\d+\s*mes(?:es)?|por\s*1\s*a[nñ]o|x\s*\d+\s*mes(?:es)?)",
+    re.IGNORECASE
+)
+LUEGO_RE = re.compile(r"(luego|despu[eé]s|desde\s+el\s+mes\s*\d+|precio\s*normal)", re.IGNORECASE)
+INSTALL_OR_EXTRA_RE = re.compile(
+    r"(instalaci[oó]n|despacho|costo|arriendo|arr[ií]endo|router|extensor|repetidor|smart\s*wifi|"
+    r"mcafee|m[uú]sica|cloud|prime\s*video|disney|streaming)",
+    re.IGNORECASE
+)
+FREE_RE = re.compile(r"(sin\s*costo|gratis)", re.IGNORECASE)
+PERIODO_RE = re.compile(
+    r"(?:por|x)\s*(\d+)\s*mes(?:es)?|por\s*1\s*a[nñ]o|por\s*un\s*a[nñ]o",
+    re.IGNORECASE
+)
 
 def normalize_gbps(num_str: str) -> str:
     val = num_str.replace(",", ".")
@@ -242,18 +263,129 @@ def infer_mobile_detail(plan: str) -> str:
         return "1000 GB"
     return ""
 
+# ---------- Clasificación de precios por contexto ----------
+def _label_price_in_context(ctx: str, start: int, end: int, window: int = 100) -> str:
+    """
+    Etiqueta un precio según las palabras cercanas (±window):
+      - 'monthly'   si hay "al mes", "/mes", "mensual", "por N meses/por 1 año/x N meses"
+      - 'later'     si hay "luego", "precio normal", etc.
+      - 'install'   si hay "instalación", "extensor", "repetidor", etc.
+      - 'unknown'   en otro caso
+    """
+    s = max(0, start - window)
+    e = min(len(ctx), end + window)
+    around = ctx[s:e].lower()
+
+    if INSTALL_OR_EXTRA_RE.search(around):
+        return "install"
+    if MONTHLY_NEAR_RE.search(around):
+        return "monthly"
+    if LUEGO_RE.search(around):
+        return "later"
+    return "unknown"
+
+def _extract_offer_period(around_text: str) -> str:
+    """
+    Devuelve string normalizado del periodo en el contexto cercano, ej. '6 meses', '1 año'.
+    """
+    m = PERIODO_RE.search(around_text)
+    if not m:
+        return ""
+    g = m.group(0).lower()
+    g = g.replace("un", "1").replace("año", "año").strip()
+    # normaliza espacios
+    return re.sub(r"\s+", " ", g)
+
+def _choose_prices_from_context(ctx: str) -> Optional[Dict[str, Optional[str]]]:
+    """
+    Recorre TODOS los precios del contexto y devuelve un diccionario con:
+      - price_offer_str / price_offer_int
+      - offer_period_str
+      - price_normal_str / price_normal_int
+      - install_cost_int / install_free (bool)
+    Lógica:
+      * Preferencia por 'monthly' con pi >= MIN_MONTHLY_CLP (elige el menor).
+      * 'later' intenta ser el precio normal (elige el menor >= umbral fuera de oferta).
+      * 'install' suma info de instalación (si 'sin costo', marca install_free=True; si tiene $X, captura).
+    """
+    if not ctx:
+        return None
+
+    labels = []
+    for m in PRICE_RE.finditer(ctx):
+        ps = m.group(0)
+        pi = clp_to_int(ps)
+        lb = _label_price_in_context(ctx, m.start(), m.end())
+        labels.append((lb, ps, pi, m.start(), m.end()))
+
+    # Oferta mensual (válida)
+    monthly = [(ps, pi, s, e) for (lb, ps, pi, s, e) in labels if lb == "monthly" and pi >= MIN_MONTHLY_CLP]
+    price_offer_str = None
+    price_offer_int = None
+    offer_period_str = ""
+
+    if monthly:
+        price_offer_str, price_offer_int, s_off, e_off = sorted(monthly, key=lambda x: x[1])[0]
+        # Busca periodo cerca del precio oferta
+        s = max(0, s_off - 120)
+        e = min(len(ctx), e_off + 120)
+        offer_period_str = _extract_offer_period(ctx[s:e]) or ""
+
+    # Precio normal/luego (válido)
+    later = [(ps, pi) for (lb, ps, pi, s, e) in labels if lb == "later" and pi >= MIN_MONTHLY_CLP]
+    price_normal_str = None
+    price_normal_int = None
+    if later:
+        price_normal_str, price_normal_int = sorted(later, key=lambda x: x[1])[0]
+
+    # Instalación
+    install_cost_int = None
+    install_free = False
+    # Si hay "instalación sin costo" sin precio explícito, marcamos free
+    if re.search(r"instalaci[oó]n[^$]{0,40}(sin\s*costo|gratis)", ctx, flags=re.IGNORECASE):
+        install_free = True
+        install_cost_int = 0
+    else:
+        inst = [(ps, pi) for (lb, ps, pi, s, e) in labels if lb == "install"]
+        if inst:
+            ps, pi = sorted(inst, key=lambda x: x[1])[0]
+            install_cost_int = pi
+            install_free = (pi == 0)
+
+    # Si no quedó nada válido, abortar
+    if not price_offer_int and not price_normal_int:
+        return None
+
+    return {
+        "price_offer_str": price_offer_str,
+        "price_offer_int": price_offer_int,
+        "offer_period_str": offer_period_str,
+        "price_normal_str": price_normal_str,
+        "price_normal_int": price_normal_int,
+        "install_cost_int": install_cost_int,
+        "install_free": install_free,
+    }
+
 # =================== EXTRACTOR con speed_hint (ventana ±1200) ===================
-def extract_plans_via_regex(html: str, max_items: int = 24, ctx_window: int = 1200) -> List[Tuple[str, str, int, str]]:
-    results: List[Tuple[str, str, int, str]] = []
+def extract_plans_via_regex(html: str, max_items: int = 24, ctx_window: int = 1200) -> List[Dict]:
+    """
+    Busca precios y datos en contexto (±ctx_window) y devuelve dicts con:
+      - plan_name, speed_hint
+      - price_offer_str / _int, offer_period_str
+      - price_normal_str / _int
+      - install_cost_int, install_free
+    Descarta contextos de Empresas/Convenios.
+    """
+    results: List[Dict] = []
     for m in PRICE_RE.finditer(html):
         start = max(m.start() - ctx_window, 0)
         end = min(m.end() + ctx_window, len(html))
         ctx = html[start:end]
 
-        # descarta contextos de Empresa/Corporativo/Convenios
         if NEGATIVE_RE.search(ctx):
             continue
 
+        # Nombre de plan
         plan_match = (
             re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,180})", ctx, re.IGNORECASE)
             or re.search(r"((?:Internet\s*)?Fibra\s*(?:Gamer|Giga|[0-9]{2,4})\s*(?:Megas?|Mb|Mbps|Gigas?)?)", ctx, re.IGNORECASE)
@@ -261,26 +393,37 @@ def extract_plans_via_regex(html: str, max_items: int = 24, ctx_window: int = 12
             or re.search(r"(TV\s*(?:Lite\+|Full\+|Online)?)", ctx, re.IGNORECASE)
             or re.search(r"(Telefon(?:ía|ia)\s*fija)", ctx, re.IGNORECASE)
         )
-        plan_name = None
+        plan_name = ""
         if plan_match:
             plan_name = re.sub(r"\s+", " ", plan_match.group(1)).strip()
             plan_name = re.sub(r"(POR\s+\d+\s+MESES|SOLO\s+FIBRA|HASTA|OFERTA\s+WEB).*$", "", plan_name, flags=re.IGNORECASE).strip(" -–:|.")
 
+        # Velocidad
         speed_hint = extract_speed_from_text(ctx)
-        price_str = m.group(0)
-        price_int = clp_to_int(price_str)
 
-        if price_int > 0:
-            results.append((plan_name or "", price_str, price_int, speed_hint))
+        # Precios
+        price_payload = _choose_prices_from_context(ctx)
+        if not price_payload:
+            continue
 
+        results.append({
+            "plan_name": plan_name,
+            "speed_hint": speed_hint,
+            **price_payload
+        })
         if len(results) >= max_items:
             break
 
-    # Dedup por (nombre, precio, speed_hint)
+    # Dedup por (plan_name, price_offer_int/normal_int, speed_hint)
     seen = set()
-    dedup: List[Tuple[str, str, int, str]] = []
+    dedup: List[Dict] = []
     for p in results:
-        key = (p[0].lower(), p[2], p[3].lower() if p[3] else "")
+        key = (
+            (p.get("plan_name") or "").lower(),
+            p.get("price_offer_int") or -1,
+            p.get("price_normal_int") or -1,
+            (p.get("speed_hint") or "").lower(),
+        )
         if key not in seen:
             seen.add(key)
             dedup.append(p)
@@ -417,23 +560,21 @@ def on_dir_change_autovalidate():
         return
 
     try:
-        # 1) forward search (gratis) con límites/headers adecuados
-        sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)  # 1.05s de pausa interna
+        sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)
         st.session_state["dir_sugerencias"] = sug or []
         if not sug:
             st.session_state["dir_status"] = "❌ No se encontró la dirección"
             return
 
-        # 2) toma la mejor coincidencia (primera) y normaliza por reverse
         best = sug[0]
         lat, lon = best.get("lat"), best.get("lon")
         if not (lat and lon):
             st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"
             return
 
-        rev = normalizar_direccion_por_latlon(lat, lon)  # incluye 1.05s de pausa
+        rev = normalizar_direccion_por_latlon(lat, lon)
         if rev and "display_name" in rev:
-            st.session_state["dir_input"] = rev["display_name"]  # auto-normaliza en el input
+            st.session_state["dir_input"] = rev["display_name"]
             st.session_state["dir_status"] = "✅ Dirección validada y normalizada"
         else:
             st.session_state["dir_status"] = "❌ No se pudo normalizar (reverse)"
@@ -441,10 +582,11 @@ def on_dir_change_autovalidate():
         st.session_state["dir_status"] = "⚠️ Error validando con Nominatim"
 
 # =================== Scraping helper (Playwright) ===================
-async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, str, int, str]]:
+async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Dict]:
     """
-    - Solo deja pasar planes cuyo NOMBRE case con `filters_regex` (fibra/mbps/mega/giga) o que tengan speed_hint.
+    - Deja pasar tarjetas cuyo NOMBRE case con `filters_regex` (fibra/mbps/mega/giga) o que tengan speed_hint.
     - Descarta contextos de Empresa/Corporativo/Convenios.
+    - Devuelve dicts con plan/prices/instalación/periodo/velocidad.
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
@@ -458,7 +600,7 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
                 extra_http_headers={"Accept-Language": "es-CL,es;q=0.9,en;q=0.8"},
             )
             page = await ctx.new_page()
-            results: List[Tuple[str, str, int, str]] = []
+            results: List[Dict] = []
             for u in urls:
                 try:
                     await page.goto(u, wait_until="domcontentloaded", timeout=30000)
@@ -469,31 +611,68 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
                     except:
                         pass
                     html = await page.content()
-                    found = extract_plans_via_regex(html, max_items=32, ctx_window=1200)
-                    kept = []
-                    for plan_name, price_str, price_int, speed_hint in found:
-                        ctx_ok = bool(speed_hint) or (plan_name and re.search(filters_regex, plan_name, re.IGNORECASE))
-                        if not ctx_ok:
+                    found = extract_plans_via_regex(html, max_items=40, ctx_window=1200)
+                    for d in found:
+                        plan_name = d.get("plan_name", "")
+                        speed_hint = d.get("speed_hint", "")
+                        # Filtro positivo por nombre (o speed_hint)
+                        if not (speed_hint or (plan_name and re.search(filters_regex, plan_name, re.IGNORECASE))):
                             continue
-                        # filtro negativo adicional sobre el nombre
+                        # Filtro negativo por nombre
                         if plan_name and NEGATIVE_RE.search(plan_name):
                             continue
-                        kept.append((plan_name, price_str, price_int, speed_hint))
-                    results.extend(kept)
+                        results.append(d)
                 except Exception:
                     continue
             # Dedup simple
             seen, dedup = set(), []
-            for plan, ps, pi, sh in results:
-                k = (plan.lower(), pi, sh.lower() if sh else "")
-                if k not in seen:
-                    seen.add(k)
-                    dedup.append((plan, ps, pi, sh))
+            for d in results:
+                key = (
+                    (d.get("plan_name") or "").lower(),
+                    d.get("price_offer_int") or -1,
+                    d.get("price_normal_int") or -1,
+                    (d.get("speed_hint") or "").lower()
+                )
+                if key not in seen:
+                    seen.add(key)
+                    dedup.append(d)
             return dedup
         finally:
             await browser.close()
 
 # =================== Scrapers HOGAR (URLs residenciales) ===================
+def _row_from_dict(d: Dict, prov_flag: Dict[str, str], pack_tipo: str, velocidad: str) -> Dict:
+    """
+    Construye una fila estándar para DataFrame con nuevas columnas de oferta/normal/instalación.
+    """
+    price_offer_str = d.get("price_offer_str") or ""
+    price_offer_int = d.get("price_offer_int") if d.get("price_offer_int") is not None else -1
+    price_normal_str = d.get("price_normal_str") or ""
+    price_normal_int = d.get("price_normal_int") if d.get("price_normal_int") is not None else -1
+    periodo = d.get("offer_period_str") or ""
+    install_cost_int = d.get("install_cost_int")
+    install_free = d.get("install_free", False)
+
+    # "costo total" = precio oferta (cuando exista) o precio normal
+    precio_mostrar = price_offer_int if price_offer_int and price_offer_int > 0 else price_normal_int
+    precio_mostrar_str = format_clp(precio_mostrar) if precio_mostrar >= 0 else (price_offer_str or price_normal_str or "")
+
+    return {
+        **prov_flag,
+        "pack seleccionado": pack_tipo,
+        "velocidad": velocidad,
+        "precio oferta": format_clp(price_offer_int) if price_offer_int and price_offer_int > 0 else (price_offer_str or ""),
+        "periodo oferta": periodo,
+        "precio normal": format_clp(price_normal_int) if price_normal_int and price_normal_int > 0 else (price_normal_str or ""),
+        "instalación": (format_clp(install_cost_int) if (install_cost_int is not None and install_cost_int > 0) else ("$0" if install_free else "")),
+        "instalación sin costo": "Sí" if (install_free or install_cost_int == 0) else "No" if (install_cost_int and install_cost_int > 0) else "",
+        "costo total": precio_mostrar_str,
+        # Auxiliares:
+        "Precio_CLP": precio_mostrar,
+        "__prov": [k for k,v in prov_flag.items() if v=="✔"][0] if any(v=="✔" for v in prov_flag.values()) else "",
+        "__plan": d.get("plan_name") or ""
+    }
+
 async def hogar_mundo() -> List[Dict]:
     urls = [
         "https://www.tumundo.cl/",
@@ -504,22 +683,16 @@ async def hogar_mundo() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
-    for plan, price_str, price_int, speed_hint in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         tipo = infer_service_type(plan)
         if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
                         "fibra + tv", "fibra + telefonía", "fibra + móvil",
                         "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
-        velocidad = infer_speed(plan) or speed_hint
-        out.append({
-            "mundo": "✔", "movistar": "", "entel": "", "wom": "", "vtr": "",
-            "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": velocidad,
-            "detalle movil": infer_mobile_detail(plan),
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
-            "__prov": "mundo", "__plan": plan
-        })
+        velocidad = infer_speed(plan) or d.get("speed_hint") or ""
+        out.append(_row_from_dict(d, {"mundo":"✔","movistar":"","entel":"","wom":"","vtr":""},
+                                  infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
 async def hogar_movistar() -> List[Dict]:
@@ -531,22 +704,16 @@ async def hogar_movistar() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
-    for plan, price_str, price_int, speed_hint in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         tipo = infer_service_type(plan)
         if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
                         "fibra + tv", "fibra + telefonía", "fibra + móvil",
                         "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
-        velocidad = infer_speed(plan) or speed_hint
-        out.append({
-            "mundo": "", "movistar": "✔", "entel": "", "wom": "", "vtr": "",
-            "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": velocidad,
-            "detalle movil": infer_mobile_detail(plan),
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
-            "__prov": "movistar", "__plan": plan
-        })
+        velocidad = infer_speed(plan) or d.get("speed_hint") or ""
+        out.append(_row_from_dict(d, {"mundo":"","movistar":"✔","entel":"","wom":"","vtr":""},
+                                  infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
 async def hogar_entel() -> List[Dict]:
@@ -556,22 +723,16 @@ async def hogar_entel() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
-    for plan, price_str, price_int, speed_hint in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         tipo = infer_service_type(plan)
         if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
                         "fibra + tv", "fibra + telefonía", "fibra + móvil",
                         "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
-        velocidad = infer_speed(plan) or speed_hint
-        out.append({
-            "mundo": "", "movistar": "", "entel": "✔", "wom": "", "vtr": "",
-            "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": velocidad,
-            "detalle movil": infer_mobile_detail(plan),
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
-            "__prov": "entel", "__plan": plan
-        })
+        velocidad = infer_speed(plan) or d.get("speed_hint") or ""
+        out.append(_row_from_dict(d, {"mundo":"","movistar":"","entel":"✔","wom":"","vtr":""},
+                                  infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
 async def hogar_wom() -> List[Dict]:
@@ -582,22 +743,16 @@ async def hogar_wom() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
-    for plan, price_str, price_int, speed_hint in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         tipo = infer_service_type(plan)
         if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
                         "fibra + tv", "fibra + telefonía", "fibra + móvil",
                         "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
-        velocidad = infer_speed(plan) or speed_hint
-        out.append({
-            "mundo": "", "movistar": "", "entel": "", "wom": "✔", "vtr": "",
-            "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": velocidad,
-            "detalle movil": infer_mobile_detail(plan),
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
-            "__prov": "wom", "__plan": plan
-        })
+        velocidad = infer_speed(plan) or d.get("speed_hint") or ""
+        out.append(_row_from_dict(d, {"mundo":"","movistar":"","entel":"","wom":"✔","vtr":""},
+                                  infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
 async def hogar_vtr() -> List[Dict]:
@@ -609,22 +764,16 @@ async def hogar_vtr() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
-    for plan, price_str, price_int, speed_hint in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         tipo = infer_service_type(plan)
         if tipo not in {"solo tv", "solo internet", "solo telefonía fija",
                         "fibra + tv", "fibra + telefonía", "fibra + móvil",
                         "fibra + tv + telefonía", "fibra + tv/telefonía"}:
             continue
-        velocidad = infer_speed(plan) or speed_hint
-        out.append({
-            "mundo": "", "movistar": "", "entel": "", "wom": "", "vtr": "✔",
-            "pack seleccionado": infer_pack(plan) if tipo.startswith("fibra") else tipo,
-            "velocidad": velocidad,
-            "detalle movil": infer_mobile_detail(plan),
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
-            "__prov": "vtr", "__plan": plan
-        })
+        velocidad = infer_speed(plan) or d.get("speed_hint") or ""
+        out.append(_row_from_dict(d, {"mundo":"","movistar":"","entel":"","wom":"","vtr":"✔"},
+                                  infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
 # =================== Scrapers MÓVIL ===================
@@ -636,14 +785,20 @@ async def movistar_movil() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"5g|plan|gb|gigas|móvil|movil")
     out: List[Dict] = []
-    for plan, price_str, price_int, _ in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         out.append({
             "mundo": "", "movistar": "✔", "entel": "", "wom": "", "vtr": "",
             "pack seleccionado": "solo internet móvil",
             "velocidad": "",
+            "precio oferta": "",
+            "periodo oferta": "",
+            "precio normal": "",
+            "instalación": "",
+            "instalación sin costo": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
+            "costo total": format_clp(d.get("price_offer_int") or d.get("price_normal_int") or -1) if (d.get("price_offer_int") or d.get("price_normal_int")) else "",
+            "Precio_CLP": d.get("price_offer_int") or d.get("price_normal_int") or -1,
             "__prov": "movistar", "__plan": plan
         })
     return out
@@ -657,14 +812,20 @@ async def entel_movil() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"plan|5g|gigas|gb|internet móvil|movil")
     out: List[Dict] = []
-    for plan, price_str, price_int, _ in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         out.append({
             "mundo": "", "movistar": "", "entel": "✔", "wom": "", "vtr": "",
             "pack seleccionado": "solo internet móvil",
             "velocidad": "",
+            "precio oferta": "",
+            "periodo oferta": "",
+            "precio normal": "",
+            "instalación": "",
+            "instalación sin costo": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
+            "costo total": format_clp(d.get("price_offer_int") or d.get("price_normal_int") or -1) if (d.get("price_offer_int") or d.get("price_normal_int")) else "",
+            "Precio_CLP": d.get("price_offer_int") or d.get("price_normal_int") or -1,
             "__prov": "entel", "__plan": plan
         })
     return out
@@ -677,14 +838,20 @@ async def wom_movil() -> List[Dict]:
     ]
     found = await _scrape_urls(urls, r"plan|gigas|gb|5g")
     out: List[Dict] = []
-    for plan, price_str, price_int, _ in found:
+    for d in found:
+        plan = d.get("plan_name") or ""
         out.append({
             "mundo": "", "movistar": "", "entel": "", "wom": "✔", "vtr": "",
             "pack seleccionado": "solo internet móvil",
             "velocidad": "",
+            "precio oferta": "",
+            "periodo oferta": "",
+            "precio normal": "",
+            "instalación": "",
+            "instalación sin costo": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
-            "costo total": format_clp(price_int) or price_str,
-            "Precio_CLP": price_int,
+            "costo total": format_clp(d.get("price_offer_int") or d.get("price_normal_int") or -1) if (d.get("price_offer_int") or d.get("price_normal_int")) else "",
+            "Precio_CLP": d.get("price_offer_int") or d.get("price_normal_int") or -1,
             "__prov": "wom", "__plan": plan
         })
     return out
@@ -695,7 +862,7 @@ def _limpiar_filtros():
     st.session_state["incluir_movistar"] = True
     st.session_state["incluir_entel"] = True
     st.session_state["incluir_wom"] = True
-    st.session_state["incluir_vtr"] = True
+    st.session_state["incluir_vtr"] = False
     st.session_state["servicios_sel_hogar"] = ["solo internet", "fibra + tv", "fibra + telefonía", "fibra + móvil"]
     st.session_state["servicios_sel_movil"] = ["solo internet móvil"]
     st.session_state["fibra_por_proveedor"] = {}
@@ -738,7 +905,7 @@ with st.sidebar:
     st.checkbox("Movistar", value=True, key="incluir_movistar")
     st.checkbox("Entel", value=True, key="incluir_entel")
     st.checkbox("WOM", value=True, key="incluir_wom")
-    st.checkbox("VTR", value=True, key="incluir_vtr")
+    st.checkbox("VTR", value=False, key="incluir_vtr")
 
     st.button("🧽 Limpiar filtros", on_click=_limpiar_filtros)
 
@@ -771,8 +938,13 @@ else:
     )
 
 # =================== Acciones por MODO ===================
-cols_final = ["mundo", "movistar", "entel", "wom", "vtr",
-              "pack seleccionado", "velocidad", "detalle movil", "costo total", "insignia"]
+cols_final = [
+    "mundo","movistar","entel","wom","vtr",
+    "pack seleccionado","velocidad",
+    "precio oferta","periodo oferta","precio normal",
+    "instalación","instalación sin costo",
+    "detalle movil","costo total","insignia"
+]
 
 # -------- HOGAR --------
 if st.session_state.get("modo_busqueda") == "Hogar":
@@ -800,7 +972,7 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                     tmp["__fibra"] = tmp["pack seleccionado"].str.contains("Fibra", case=False) | \
                                      (tmp["pack seleccionado"].str.lower() == "solo internet")
                     tmp = tmp[tmp["__fibra"] == True]
-                    for prov in ["mundo", "movistar", "entel", "wom", "vtr"]:
+                    for prov in ["mundo","movistar","entel","wom","vtr"]:
                         sub = tmp[tmp[prov] == "✔"].sort_values(by="Precio_CLP", na_position="last")
                         if not sub.empty:
                             first = sub.iloc[0]
@@ -819,11 +991,11 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                     df = df[df["__tipo"].isin(seleccion)]
                     df = df.drop(columns=["__tipo"], errors="ignore")
 
-                # >>> INSIGNIA + DEDUP HOGAR
+                # >>> INSIGNIA + DEDUP HOGAR (usa Precio_CLP basado en oferta)
                 if not df.empty:
                     df["insignia"] = ""
                     if "Precio_CLP" in df.columns:
-                        grp = ["__prov", "velocidad", "pack seleccionado"]
+                        grp = ["__prov","velocidad","pack seleccionado"]
                         idx_min = df.groupby(grp, dropna=False)["Precio_CLP"].idxmin()
                         df.loc[idx_min, "insignia"] = "🏷️ Oferta más barata"
                         df = df.sort_values(by="Precio_CLP", na_position="last")
@@ -834,11 +1006,13 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                 if df.empty:
                     st.info("No se encontraron planes que coincidan con los filtros (Hogar).")
                 else:
-                    if "Precio_CLP" in df.columns:
-                        df = df.sort_values(by="Precio_CLP", na_position="last")
+                    # Asegurar columnas finales y vacíos como ""
                     for c in cols_final:
                         if c not in df.columns:
                             df[c] = ""
+                    # Orden por precio oferta/normal
+                    if "Precio_CLP" in df.columns:
+                        df = df.sort_values(by="Precio_CLP", na_position="last")
                     st.success("¡Ofertas Hogar encontradas!")
                     st.dataframe(df[cols_final], use_container_width=True)
 
@@ -875,7 +1049,7 @@ else:
                     fibra_map = st.session_state.get("fibra_por_proveedor", {})
                     combos: List[Dict] = []
                     if fibra_map and not dfm.empty:
-                        for prov in ["movistar", "entel", "wom"]:
+                        for prov in ["movistar","entel","wom"]:
                             mov_sub = dfm[dfm[prov] == "✔"].sort_values(by="Precio_CLP", na_position="last")
                             if not mov_sub.empty and prov in fibra_map and fibra_map[prov]["precio"] >= 0:
                                 movil_row = mov_sub.iloc[0]
@@ -889,6 +1063,11 @@ else:
                                     "pack seleccionado": "Fibra + Móvil",
                                     "velocidad": fibra_map[prov].get("velocidad", ""),
                                     "detalle movil": movil_row.get("detalle movil", "") or "Gigas Libres/GB",
+                                    "precio oferta": "",
+                                    "periodo oferta": "",
+                                    "precio normal": "",
+                                    "instalación": "",
+                                    "instalación sin costo": "",
                                     "costo total": format_clp(total),
                                     "Precio_CLP": total,
                                     "__prov": prov,
@@ -902,7 +1081,7 @@ else:
                     if "insignia" not in dfm.columns:
                         dfm["insignia"] = ""
                     if "Precio_CLP" in dfm.columns:
-                        grp_m = ["__prov", "pack seleccionado", "detalle movil"]
+                        grp_m = ["__prov","pack seleccionado","detalle movil"]
                         idx_min_m = dfm.groupby(grp_m, dropna=False)["Precio_CLP"].idxmin()
                         dfm.loc[idx_min_m, "insignia"] = "🏷️ Oferta más barata"
                         dfm = dfm.sort_values(by="Precio_CLP", na_position="last")
@@ -913,11 +1092,11 @@ else:
                 if dfm.empty:
                     st.info("No se encontraron planes móviles (o selecciona 'Fibra + Móvil' tras ejecutar primero Hogar).")
                 else:
-                    if "Precio_CLP" in dfm.columns:
-                        dfm = dfm.sort_values(by="Precio_CLP", na_position="last")
                     for c in cols_final:
                         if c not in dfm.columns:
                             dfm[c] = ""
+                    if "Precio_CLP" in dfm.columns:
+                        dfm = dfm.sort_values(by="Precio_CLP", na_position="last")
                     st.success("¡Planes móviles listos!")
                     st.dataframe(dfm[cols_final], use_container_width=True)
 
