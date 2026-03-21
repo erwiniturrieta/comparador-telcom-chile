@@ -399,42 +399,65 @@ def parse_direccion_chile(q: str) -> Tuple[str, str, str]:
     return calle, numero, comuna
 
 def on_dir_change_autovalidate():
+    """
+    1) Intenta parsear 'calle numero [comuna]' y hace búsqueda ESTRUCTURADA.
+    2) Si encuentra coincidencia EXACTA (mismo house_number), normaliza (display_name) y marca ✅.
+    3) Si NO hay exacta, usa la MEJOR COINCIDENCIA (vía/barrio/comuna) y:
+        - escribe igualmente en el input (para avanzar con planes),
+        - marca estado ⚠️ 'Dirección aproximada'.
+    4) Como último recurso, intenta forward search (q=...).
+    """
     q = (st.session_state.get("dir_input") or "").strip()
     if len(q) < 5:
         st.session_state["dir_sugerencias"] = []
         st.session_state["dir_status"] = "Escriba una dirección más específica"
         return
+
     try:
         calle, numero, comuna = parse_direccion_chile(q)
-        best = None
+        best_exact = None
+        best_any = None
+
+        # --- 1) Búsqueda ESTRUCTURADA (prioritaria)
         if calle and numero:
             cand = buscar_direccion_estructurada(calle, numero, comuna)
             if cand:
+                best_any = cand  # al menos tenemos una (puede ser la vía)
                 addr = cand.get("address", {})
                 hn = (addr.get("house_number") or "").strip()
                 if hn == numero or f" {numero} " in f" {cand.get('display_name','')} ":
-                    best = cand
-        if not best:
-            # Fallback difuso
+                    best_exact = cand
+
+        # --- 2) Fallback: forward search difuso (q)
+        if not best_any:
             sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)
             st.session_state["dir_sugerencias"] = sug or []
             if sug:
-                best = sug[0]
-        if not best:
-            st.session_state["dir_status"] = "❌ No se encontró la dirección exacta"
+                best_any = sug[0]
+
+        # Si no hay nada, informar y salir
+        if not best_any:
+            st.session_state["dir_status"] = "❌ No se encontró ninguna coincidencia"
             return
-        lat, lon = best.get("lat"), best.get("lon")
-        if not (lat and lon):
-            st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"
-            return
-        rev = normalizar_direccion_por_latlon(lat, lon)
-        final = rev if (rev and "display_name" in rev) else best
+
+        # --- 3) Normalizar por reverse para estandarizar etiqueta
+        lat, lon = best_any.get("lat"), best_any.get("lon")
+        rev = None
+        if lat and lon:
+            rev = normalizar_direccion_por_latlon(lat, lon)
+        final = rev if (rev and "display_name" in rev) else best_any
         disp = final.get("display_name", "")
-        if numero and f" {numero} " not in f" {disp} ":
-            st.session_state["dir_status"] = "⚠️ Se encontró la vía, no el número exacto"
-            return
-        st.session_state["dir_input"] = disp
-        st.session_state["dir_status"] = "✅ Dirección validada y normalizada"
+
+        # --- 4) Lógica de exactitud
+        if best_exact:
+            # Exacta → sobre-escribe input y marca ✅
+            st.session_state["dir_input"] = disp
+            st.session_state["dir_status"] = "✅ Dirección validada y normalizada"
+        else:
+            # Aproximada → sobre-escribe input y marca ⚠️
+            st.session_state["dir_input"] = disp
+            st.session_state["dir_status"] = "⚠️ Dirección aproximada (no se encontró el número exacto)"
+
     except Exception:
         st.session_state["dir_status"] = "⚠️ Error validando con Nominatim"
 
