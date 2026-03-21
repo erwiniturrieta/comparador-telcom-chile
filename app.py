@@ -7,7 +7,7 @@ from typing import List, Dict, Tuple
 
 import pandas as pd
 import streamlit as st
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from playwright.async_api import async_playwright
 
 
 # ============ Configuración de página ============
@@ -28,15 +28,13 @@ def ensure_chromium_installed():
         os.path.expanduser("~/.cache/ms-playwright")
     )
     try:
-        completed = subprocess.run(
+        subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        # Si necesitas ver el log de instalación, descomenta:
-        # st.code(completed.stdout, language="bash")
     except subprocess.CalledProcessError as e:
         st.error("No fue posible descargar Chromium automáticamente.")
         st.code(e.stdout or "", language="bash")
@@ -61,6 +59,9 @@ def run_async(coro):
         return asyncio.run(coro)
 
 
+# ------------ Normalizadores / Heurísticas ------------
+PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
+
 def clp_to_int(texto: str) -> int:
     """Convierte '$21.990/mes' -> 21990; devuelve -1 si no se puede."""
     if not texto:
@@ -68,49 +69,109 @@ def clp_to_int(texto: str) -> int:
     nums = re.findall(r"\d+", texto.replace(".", ""))
     return int(nums[0]) if nums else -1
 
-
 def format_clp(valor: int) -> str:
     return f"${valor:,.0f}".replace(",", ".") if valor >= 0 else ""
 
-
-def dump_preview(label: str, text: str, max_chars: int = 5000):
-    """Muestra un recorte de HTML/Texto para diagnóstico."""
-    if not text:
-        st.caption(f"{label}: (vacío)")
-        return
-    preview = text[:max_chars]
-    st.expander(f"🔎 {label} (primeros {len(preview)} chars)").code(preview, language="html")
-
-
-# ============ Heurísticas para extraer planes desde HTML (robusto a cambios de CSS) ============
-PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
-
-def extract_plans_via_regex(html: str, max_items: int = 8) -> List[Tuple[str, str, int]]:
+def infer_speed(plan: str) -> str:
     """
-    Heurística: busca precios CLP y en una ventana cercana detecta el nombre del plan
-    (líneas tipo 'PLAN 1 ...', 'Fibra 800', etc.).
-    Devuelve lista de (plan, precio_str, precio_int) deduplicada y acotada.
+    Extrae velocidad desde el nombre del plan: 600/800/940/1000, 1 Giga, 10 Gigas, etc.
+    Retorna '600 Mbps', '1 Gbps', '10 Gbps', etc. Si no encuentra, ''.
+    """
+    if not plan:
+        return ""
+    txt = plan.lower()
+
+    # '10 Gigas', '3 Gigas', '1 Giga'
+    m_gigas = re.search(r"(\d+)\s*giga?s?", txt)
+    if m_gigas:
+        val = int(m_gigas.group(1))
+        return f"{val} Gbps" if val != 1 else "1 Gbps"
+
+    # 1000/3000/5000/10000 → Gbps
+    m_gbps = re.search(r"\b(10000|5000|3000|2000|1000)\b", txt)
+    if m_gbps:
+        v = int(m_gbps.group(1))
+        return f"{v//1000} Gbps" if v % 1000 == 0 else f"{v} Mbps"
+
+    # 940 caso especial
+    if re.search(r"\b940\b", txt):
+        return "940 Mbps"
+
+    # 600/800/… (y algunos mínimos frecuentes en catálogos)
+    m_mbps = re.search(r"\b(150|300|400|500|560|600|700|800|900)\b", txt)
+    if m_mbps:
+        return f"{m_mbps.group(1)} Mbps"
+
+    # Gamer suele ser 940 en algunos catálogos
+    if "gamer" in txt and "940" not in txt:
+        return "940 Mbps"
+
+    return ""
+
+def infer_pack(plan: str) -> str:
+    """
+    Define 'Pack Seleccionado' según el texto del plan:
+    - Contiene 'tv' o 'go' (Mundo GO) -> 'Fibra + TV'
+    - Contiene 'tel'/'fija' -> 'Fibra + Telefonía'
+    - Contiene 'portabilidad'/'móvil'/'gigas' -> 'Fibra + Móvil'
+    - Contiene 'dúo'/'duo' -> 'Fibra + TV/Telefonía' (genérico dúo)
+    - Si no coincide -> 'Solo Fibra'
+    """
+    if not plan:
+        return "Solo Fibra"
+    t = plan.lower()
+    if "portabilidad" in t or "móvil" in t or "movil" in t or "gigas" in t:
+        return "Fibra + Móvil"
+    if "tv" in t or "mundo go" in t or "go!" in t:
+        return "Fibra + TV"
+    if "telef" in t or "fija" in t:
+        return "Fibra + Telefonía"
+    if "dúo" in t or "duo" in t:
+        return "Fibra + TV/Telefonía"
+    return "Solo Fibra"
+
+def infer_mobile_detail(plan: str) -> str:
+    """
+    Intenta extraer detalle móvil (p. ej. 'Gigas Libres', '100 GB') desde el texto del plan.
+    Si no encuentra, devuelve ''.
+    """
+    if not plan:
+        return ""
+    t = plan.lower()
+    if "gigas libres" in t or "gigaslibres" in t:
+        return "Gigas Libres"
+    m = re.search(r"(\d+)\s*gb", t)
+    if m:
+        return f"{m.group(1)} GB"
+    return ""
+
+def extract_plans_via_regex(html: str, max_items: int = 12) -> List[Tuple[str, str, int]]:
+    """
+    Heurística genérica: busca precios CLP y en una ventana cercana detecta el nombre del plan
+    (líneas tipo 'PLAN 1 ...', 'Fibra 800', 'Internet Fibra 600 Megas', etc.).
+    Devuelve lista de (plan, precio_str, precio_int), deduplicada y acotada.
     """
     results: List[Tuple[str, str, int]] = []
 
     for m in PRICE_RE.finditer(html):
-        start = max(m.start() - 160, 0)
-        end = min(m.end() + 160, len(html))
+        start = max(m.start() - 220, 0)
+        end = min(m.end() + 220, len(html))
         ctx = html[start:end]
 
-        # 'PLAN X ...' cerca del precio
-        plan_match = re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,80})", ctx, re.IGNORECASE)
-        if not plan_match:
-            # Alternativa: “Fibra 800”, “Fibra 1G”, “Fibra 10 GIGAS”, etc.
-            plan_match = re.search(r"(Fibra\s*[0-9]+(?:\s*GIGAS?|G|GB|MB)?[^\$<>{}|]{0,40})",
-                                   ctx, re.IGNORECASE)
+        # 'Plan' cercano (PLAN X, Internet Fibra 600/800/Giga, Fibra 940, etc.)
+        plan_match = (
+            re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,90})", ctx, re.IGNORECASE)
+            or re.search(r"((?:Internet\s*)?Fibra\s*(?:Gamer|Giga|[0-9]{2,4})\s*(?:Megas?|Mb|Mbps|Gigas?)?)",
+                         ctx, re.IGNORECASE)
+            or re.search(r"((?:Fibra|Internet)\s*[0-9]{2,4}\s*(?:Mb|Mbps))", ctx, re.IGNORECASE)
+        )
 
         plan_name = None
         if plan_match:
             plan_name = re.sub(r"\s+", " ", plan_match.group(1)).strip()
-            # Limpia ruido común
-            plan_name = re.sub(r"(POR\s+\d+\s+MESES|SOLO\s+FIBRA|HASTA)\b.*",
-                               "", plan_name, flags=re.IGNORECASE).strip(" -–:|")
+            # Limpia ruido típico
+            plan_name = re.sub(r"(POR\s+\d+\s+MESES|SOLO\s+FIBRA|HASTA|OFERTA\s+WEB).*$",
+                               "", plan_name, flags=re.IGNORECASE).strip(" -–:|.")
 
         price_str = m.group(0)
         price_int = clp_to_int(price_str)
@@ -131,13 +192,11 @@ def extract_plans_via_regex(html: str, max_items: int = 8) -> List[Tuple[str, st
     return dedup
 
 
-# ============ Scraper Mundo (async) con fallback de URLs ============
-async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True) -> List[Dict]:
+# ============ Scraper Mundo ============
+async def buscar_en_mundo(quiere_internet: bool = True) -> List[Dict]:
     """
-    Intenta obtener planes de Mundo desde:
-    1) https://mundointernet.cl/p/td/mundo-internet-planes.html  (landing con planes)
-    2) https://www.tumundo.cl/  (home con ofertas)
-    Nota: /internet/ hoy retorna 404 y no se usa. (Se confirmó de forma pública)  # Referencia en explicación
+    1) https://mundointernet.cl/p/td/mundo-internet-planes.html (landing con planes)
+    2) https://www.tumundo.cl/ (home con ofertas)
     """
     if not quiere_internet:
         return []
@@ -149,7 +208,7 @@ async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True)
         )
         try:
             context = await browser.new_context(
-                viewport={"width": 390, "height": 844},  # viewport móvil
+                viewport={"width": 390, "height": 844},
                 user_agent=(
                     "Mozilla/5.0 (Linux; Android 13; SM-G991B) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -164,23 +223,16 @@ async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True)
             )
             page = await context.new_page()
 
-            # ---------- Intento 1: MundoInternet (planes)
+            # Intento 1: MundoInternet (catálogo)
             url1 = "https://mundointernet.cl/p/td/mundo-internet-planes.html"
-            resp1 = await page.goto(url1, wait_until="domcontentloaded", timeout=30000)
-            status1 = resp1.status if resp1 else None
-            if modo_debug:
-                st.caption(f"🌐 MundoInternet status: {status1}")
-
+            await page.goto(url1, wait_until="domcontentloaded", timeout=30000)
             html1 = await page.content()
-            plans = extract_plans_via_regex(html1, max_items=8)
+            plans = extract_plans_via_regex(html1, max_items=10)
 
-            # ---------- Fallback: Home TuMundo (ofertas) si el anterior no dio resultados
             if not plans:
+                # Fallback: Home TuMundo (ofertas)
                 url2 = "https://www.tumundo.cl/"
-                resp2 = await page.goto(url2, wait_until="domcontentloaded", timeout=30000)
-                status2 = resp2.status if resp2 else None
-                if modo_debug:
-                    st.caption(f"🌐 TuMundo Home status: {status2}")
+                await page.goto(url2, wait_until="domcontentloaded", timeout=30000)
                 try:
                     await page.wait_for_load_state("networkidle", timeout=15000)
                     await page.mouse.wheel(0, 1800)
@@ -188,33 +240,109 @@ async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True)
                 except:
                     pass
                 html2 = await page.content()
-                plans = extract_plans_via_regex(html2, max_items=8)
+                plans = extract_plans_via_regex(html2, max_items=10)
 
-            if modo_debug and not plans:
-                try:
-                    png = await page.screenshot(full_page=True)
-                    st.image(png, caption="📸 Screenshot (Mundo)")
-                except Exception as e:
-                    st.caption(f"No se pudo tomar screenshot: {e}")
-
-                try:
-                    snippet = (await page.content())[:6000]
-                    dump_preview("HTML capturado (primeros 6000 chars)", snippet, max_chars=6000)
-                except:
-                    pass
-
-            # Estructura de salida
             out: List[Dict] = []
             for nombre_plan, precio_str, precio_int in plans:
                 out.append({
                     "Compañía": "Mundo",
-                    "Tipo": "Fibra",
-                    "Plan": nombre_plan,
-                    "Precio": format_clp(precio_int) or precio_str,
+                    "Pack Seleccionado": infer_pack(nombre_plan),
+                    "Velocidad": infer_speed(nombre_plan),
+                    "Detalle Móvil": infer_mobile_detail(nombre_plan),
+                    "Costo Total": format_clp(precio_int) or precio_str,
+                    "Precio_CLP": precio_int
+                })
+            out.sort(key=lambda r: (r["Precio_CLP"] if r["Precio_CLP"] > 0 else 99_999_999))
+            return out
+
+        finally:
+            await browser.close()
+
+
+# ============ Scraper Movistar ============
+async def buscar_en_movistar(quiere_internet: bool = True) -> List[Dict]:
+    """
+    Intenta obtener planes de Movistar desde:
+    1) https://ww2.movistar.cl/hogar/internet-hogar/
+    2) https://ww2.movistar.cl/hogar/internet-fibra-optica/
+    3) https://ww2.movistar.cl/hogar/pack-duos-internet-television/ (combos TV)
+    4) https://www.movistar.cl/ (home, último fallback)
+    """
+    if not quiere_internet:
+        return []
+
+    urls_prioridad = [
+        "https://ww2.movistar.cl/hogar/internet-hogar/",
+        "https://ww2.movistar.cl/hogar/internet-fibra-optica/",
+        "https://ww2.movistar.cl/hogar/pack-duos-internet-television/",
+        "https://www.movistar.cl/",
+    ]
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        try:
+            context = await browser.new_context(
+                viewport={"width": 390, "height": 844},
+                user_agent=(
+                    "Mozilla/5.0 (Linux; Android 13; SM-G991B) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Mobile Safari/537.36"
+                ),
+                locale="es-CL",
+                extra_http_headers={
+                    "Accept-Language": "es-CL,es;q=0.9,en;q=0.8",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                },
+            )
+            page = await context.new_page()
+
+            plans_all: List[Tuple[str, str, int]] = []
+
+            for url in urls_prioridad:
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=12000)
+                        await page.mouse.wheel(0, 2000)
+                        await page.wait_for_timeout(600)
+                    except:
+                        pass
+
+                    html = await page.content()
+                    found = extract_plans_via_regex(html, max_items=12)
+                    # Evita captar precios móviles puros si llegaran a filtrarse
+                    found = [f for f in found if re.search(r"fibra|internet", f[0], re.IGNORECASE)]
+                    plans_all.extend(found)
+
+                    if len(plans_all) >= 8:
+                        break
+                except Exception:
+                    continue
+
+            # Deduplicar por (plan, precio)
+            seen = set()
+            dedup: List[Tuple[str, str, int]] = []
+            for plan in plans_all:
+                key = (plan[0].lower(), plan[2])
+                if key not in seen:
+                    seen.add(key)
+                    dedup.append(plan)
+
+            out: List[Dict] = []
+            for nombre_plan, precio_str, precio_int in dedup[:10]:
+                out.append({
+                    "Compañía": "Movistar",
+                    "Pack Seleccionado": infer_pack(nombre_plan),
+                    "Velocidad": infer_speed(nombre_plan),
+                    "Detalle Móvil": infer_mobile_detail(nombre_plan),  # 'Gigas Libres', '100 GB', etc. si se detecta
+                    "Costo Total": format_clp(precio_int) or precio_str,
                     "Precio_CLP": precio_int
                 })
 
-            # Orden por precio (si hay numérico)
             out.sort(key=lambda r: (r["Precio_CLP"] if r["Precio_CLP"] > 0 else 99_999_999))
             return out
 
@@ -229,15 +357,35 @@ with st.sidebar:
     dir_completa = st.text_input("Dirección y Comuna")
 
 
-# ============ Preferencias ============
+# ============ Preferencias de servicio ============
 st.subheader("¿Qué servicios necesitas?")
 col1, col2 = st.columns(2)
 with col1:
     quiere_internet = st.checkbox("🌐 Internet Fibra", value=True)
-    quiere_movil = st.checkbox("📱 Telefonía Móvil")
+    # Reservado para siguientes iteraciones
+    quiere_movil = st.checkbox("📱 Telefonía Móvil", value=False)
 with col2:
-    quiere_tv = st.checkbox("📺 TV Cable")
-    quiere_fija = st.checkbox("☎️ Telefonía Fija")
+    quiere_tv = st.checkbox("📺 TV Cable", value=False)
+    quiere_fija = st.checkbox("☎️ Telefonía Fija", value=False)
+
+# Selección de tipo(s) de comparación
+st.subheader("¿Qué tipo(s) de pack comparar?")
+tipos_pack = st.multiselect(
+    "Puedes seleccionar uno o varios:",
+    options=["Solo Fibra", "Fibra + TV", "Fibra + Móvil", "Fibra + TV + Telefonía", "Fibra + Telefonía", "Fibra + TV/Telefonía"],
+    default=["Solo Fibra", "Fibra + TV", "Fibra + Móvil"]  # valores por defecto más usados
+)
+
+# Proveedores
+st.subheader("¿Con qué compañías comparar?")
+colA, colB = st.columns(2)
+with colA:
+    incluir_mundo = st.checkbox("Mundo", value=True)
+with colB:
+    incluir_movistar = st.checkbox("Movistar", value=True)
+
+# Toggle de diagnóstico (apagado por defecto)
+modo_debug = st.toggle("Modo diagnóstico (screenshots/HTML)", value=False)
 
 
 # ============ Acción ============
@@ -251,24 +399,46 @@ if st.button("Buscar Ofertas Reales 🚀", use_container_width=True):
         except Exception:
             st.stop()
 
-        # 2) Consultar Mundo con modo debug activo
-        with st.spinner("Consultando Mundo Pacífico..."):
+        resultados: List[Dict] = []
+
+        # 2) Consultas (secuencial para menor RAM)
+        with st.spinner("Consultando proveedores..."):
             try:
-                resultados_mundo = run_async(
-                    buscar_en_mundo(quiere_internet=quiere_internet, modo_debug=True)
-                )
-                df = pd.DataFrame(resultados_mundo)
+                if incluir_mundo:
+                    st.caption("🔍 Mundo…")
+                    resultados_mundo = run_async(buscar_en_mundo(quiere_internet=quiere_internet))
+                    resultados.extend(resultados_mundo)
+
+                if incluir_movistar:
+                    st.caption("🔍 Movistar…")
+                    resultados_movistar = run_async(buscar_en_movistar(quiere_internet=quiere_internet))
+                    resultados.extend(resultados_movistar)
+
+                df = pd.DataFrame(resultados)
+
+                # 3) Filtrar por tipos de pack seleccionados
+                if tipos_pack:
+                    df = df[df["Pack Seleccionado"].isin(tipos_pack)]
+                else:
+                    # Si no elige nada, no mostramos para evitar confusión
+                    df = df.iloc[0:0]
 
                 if df.empty:
-                    st.info("No se encontraron planes (cambió el DOM o hubo protección anti-bot). "
-                            "Revisa los diagnósticos arriba 👆.")
+                    st.info("No hay planes que coincidan con los filtros. "
+                            "Prueba seleccionando más tipos de pack o activa diagnóstico.")
                 else:
-                    mostrar = df[["Compañía", "Tipo", "Plan", "Precio"]]
+                    # Ordena por precio si está disponible
+                    if "Precio_CLP" in df.columns:
+                        df = df.sort_values(by="Precio_CLP", na_position="last")
+
+                    # Vista final con las 5 columnas solicitadas
+                    cols = ["Compañía", "Pack Seleccionado", "Velocidad", "Detalle Móvil", "Costo Total"]
+                    mostrar = df[cols]
                     st.success("¡Ofertas encontradas!")
                     st.dataframe(mostrar, use_container_width=True)
 
             except Exception as e:
-                st.error(f"Falla al consultar Mundo: {e}")
+                st.error(f"Falla en la consulta: {e}")
                 st.caption(
                     "Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez. "
                     "La primera descarga de Chromium puede tardar un poco."
