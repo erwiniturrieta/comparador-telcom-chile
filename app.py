@@ -1,11 +1,13 @@
 # app.py
 # Comparador Telecom Chile - Hogar/Móvil
 # - RUT: autoformato + validación (módulo-11) al escribir (corrige punto fantasma; respeta ceros iniciales)
-# - Dirección: validación/normalización automática y ESPECÍFICA con Nominatim (búsqueda estructurada + verificación house_number)
+# - Dirección: validación/normalización automática (forward search + reverse) con tu función
 # - Solo Hogar: listas blancas de URLs residenciales por proveedor
 # - Velocidad: extraída del nombre o del CONTEXTO HTML cercano al precio (Mbps/Gbps, "Mega(s)", "Mb/s", "Giga", "hasta ...")
 # - Scrapers: Mundo / Movistar / Entel / WOM (+ VTR fallback) para Hogar; Movistar/Entel/WOM para Móvil
 # - Botón "Limpiar filtros" y modo exclusivo Hogar/Móvil
+# - DEDUP + INSIGNIA: evita duplicados por compañía/velocidad/pack (Hogar) y compañía/pack/detalle/Precio (Móvil),
+#   marcando la fila ganadora como "🏷️ Oferta más barata"
 
 import os
 import re
@@ -331,7 +333,7 @@ NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 def _nominatim_headers():
     return {"User-Agent": "MiComparadorTelecom/1.0 (Streamlit; contacto: soporte@ejemplo.cl)"}
 
-def buscar_direccion_gratis(q: str, countrycodes: str = "cl", limit: int = 5) -> List[Dict]:
+def buscar_direccion_gratis(q: str, countrycodes: str = "cl", limit: int = 3) -> List[Dict]:
     if not q:
         return []
     params = {"q": q, "format": "jsonv2", "addressdetails": 1, "limit": limit, "countrycodes": countrycodes}
@@ -351,53 +353,7 @@ def normalizar_direccion_por_latlon(lat: str, lon: str) -> Optional[Dict]:
         return None
     return r.json()
 
-DIR_PAT = re.compile(r"^\s*(.+?)\s+(\d{1,6})(?:\s*,?\s*(.+))?$", re.IGNORECASE)
-
-def _normalize_comuna(txt: str) -> str:
-    if not txt:
-        return ""
-    t_raw = unicodedata.normalize("NFKD", txt).encode("ascii", "ignore").decode("ascii").lower().strip()
-    # correcciones comunes
-    fixes = {
-        "nunoa": "Ñuñoa", "nunoa,": "Ñuñoa",
-        "maipu": "Maipú",
-        "penalolen": "Peñalolén", "penalolen,": "Peñalolén",
-        "oscar": "Óscar", "san oscar": "San Óscar",
-        "santiago": "Santiago", "macul": "Macul", "providencia": "Providencia",
-        "las condes": "Las Condes",
-    }
-    if t_raw in fixes:
-        return fixes[t_raw]
-    return " ".join(w.capitalize() for w in txt.strip().split())
-
-def buscar_direccion_estructurada(calle: str, numero: str, comuna: str = "") -> Optional[Dict]:
-    params = {
-        "format": "jsonv2",
-        "addressdetails": 1,
-        "limit": 1,
-        "countrycodes": "cl",
-        "street": f"{calle} {numero}",
-    }
-    if comuna:
-        params["city"] = comuna
-    time.sleep(1.05)
-    r = requests.get(NOMINATIM_SEARCH, params=params, headers=_nominatim_headers(), timeout=20)
-    if r.status_code != 200:
-        return None
-    data = r.json()
-    if not data:
-        return None
-    return data[0]
-
-def parse_direccion_chile(q: str) -> Tuple[str, str, str]:
-    m = DIR_PAT.match(q)
-    if not m:
-        return "", "", ""
-    calle = _normalize_comuna(m.group(1))
-    numero = m.group(2)
-    comuna = _normalize_comuna(m.group(3) or "")
-    return calle, numero, comuna
-
+# === TU VALIDACIÓN (forward search → reverse) ===
 def on_dir_change_autovalidate():
     """
     Valida y normaliza dirección automáticamente al cambiar el input:
@@ -431,27 +387,6 @@ def on_dir_change_autovalidate():
             st.session_state["dir_status"] = "✅ Dirección validada y normalizada"
         else:
             st.session_state["dir_status"] = "❌ No se pudo normalizar (reverse)"
-    except Exception:
-        st.session_state["dir_status"] = "⚠️ Error validando con Nominatim"
-
-        # --- 3) Normalizar por reverse para estandarizar etiqueta
-        lat, lon = best_any.get("lat"), best_any.get("lon")
-        rev = None
-        if lat and lon:
-            rev = normalizar_direccion_por_latlon(lat, lon)
-        final = rev if (rev and "display_name" in rev) else best_any
-        disp = final.get("display_name", "")
-
-        # --- 4) Lógica de exactitud
-        if best_exact:
-            # Exacta → sobre-escribe input y marca ✅
-            st.session_state["dir_input"] = disp
-            st.session_state["dir_status"] = "✅ Dirección validada y normalizada"
-        else:
-            # Aproximada → sobre-escribe input y marca ⚠️
-            st.session_state["dir_input"] = disp
-            st.session_state["dir_status"] = "⚠️ Dirección aproximada (no se encontró el número exacto)"
-
     except Exception:
         st.session_state["dir_status"] = "⚠️ Error validando con Nominatim"
 
@@ -503,7 +438,6 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
 async def hogar_mundo() -> List[Dict]:
     urls = [
         "https://www.tumundo.cl/",
-        # Páginas de planes residenciales (cuando corresponda)
         "https://www.tumundo.cl/planes-hogar/fibra-3g/",
         "https://www.tumundo.cl/planes-hogar/fibra-3000-1500-tv-mundo-go/",
         "https://www.tumundo.cl/planes-hogar/fibra-1g-mundo-go/",
@@ -723,7 +657,7 @@ with st.sidebar:
     st.text_input(
         "Dirección (auto-validación y normalización)",
         key="dir_input",
-        placeholder="calle y número, comuna (ej: calle 1234 comuna)",
+        placeholder="calle y número, comuna (ej: San Óscar 2807 Maipú)",
         on_change=on_dir_change_autovalidate
     )
     st.caption(st.session_state.get("dir_status", "Escribe una dirección y presiona Enter"))
@@ -775,7 +709,7 @@ else:
 
 # =================== Acciones por MODO ===================
 cols_final = ["mundo", "movistar", "entel", "wom", "vtr",
-              "pack seleccionado", "velocidad", "detalle movil", "costo total"]
+              "pack seleccionado", "velocidad", "detalle movil", "costo total", "insignia"]
 
 # -------- HOGAR --------
 if st.session_state.get("modo_busqueda") == "Hogar":
@@ -820,13 +754,30 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                     df["__tipo"] = df["pack seleccionado"].str.lower().fillna("")
                     df.loc[df["__tipo"] == "solo fibra", "__tipo"] = "solo internet"
                     df = df[df["__tipo"].isin(seleccion)]
-                    df = df.drop(columns=["__tipo", "__prov", "__plan"], errors="ignore")
+                    df = df.drop(columns=["__tipo"], errors="ignore")
+
+                # >>> INSIGNIA + DEDUP HOGAR
+                if not df.empty:
+                    # Inicializa columna insignia
+                    df["insignia"] = ""
+                    # Marca como "Oferta más barata" al mínimo Precio_CLP por (__prov, velocidad, pack)
+                    if "Precio_CLP" in df.columns:
+                        grp = ["__prov", "velocidad", "pack seleccionado"]
+                        idx_min = df.groupby(grp, dropna=False)["Precio_CLP"].idxmin()
+                        df.loc[idx_min, "insignia"] = "🏷️ Oferta más barata"
+                        # Ordena por precio y dedup por grupo, quedando la ganadora
+                        df = df.sort_values(by="Precio_CLP", na_position="last")
+                        df = df.loc[~df.duplicated(subset=grp, keep="first")].copy()
+                    else:
+                        # Si no hay Precio_CLP por alguna razón, al menos dedup por grupo
+                        df = df.loc[~df.duplicated(subset=["__prov","velocidad","pack seleccionado"], keep="first")].copy()
 
                 if df.empty:
                     st.info("No se encontraron planes que coincidan con los filtros (Hogar).")
                 else:
                     if "Precio_CLP" in df.columns:
                         df = df.sort_values(by="Precio_CLP", na_position="last")
+                    # Asegura todas las columnas de salida
                     for c in cols_final:
                         if c not in df.columns:
                             df[c] = ""
@@ -851,10 +802,10 @@ else:
                 if st.session_state.get("incluir_movistar"): resultados_movil.extend(run_async(movistar_movil()))
                 if st.session_state.get("incluir_entel"):    resultados_movil.extend(run_async(entel_movil()))
                 if st.session_state.get("incluir_wom"):      resultados_movil.extend(run_async(wom_movil()))
-                # (Móvil de Mundo/VTR no se expone como landing clara en esta versión)
 
                 dfm = pd.DataFrame(resultados_movil)
 
+                # Filtrar por selección móvil
                 seleccion = [s.lower() for s in st.session_state.get("servicios_sel_movil", [])]
                 if not dfm.empty:
                     dfm["__tipo"] = dfm["pack seleccionado"].str.lower().fillna("")
@@ -881,10 +832,23 @@ else:
                                     "velocidad": fibra_map[prov].get("velocidad", ""),
                                     "detalle movil": movil_row.get("detalle movil", "") or "Gigas Libres/GB",
                                     "costo total": format_clp(total),
-                                    "Precio_CLP": total
+                                    "Precio_CLP": total,
+                                    "__prov": prov,
                                 })
                     if combos:
                         dfm = pd.concat([dfm, pd.DataFrame(combos)], ignore_index=True)
+
+                # >>> INSIGNIA + DEDUP MÓVIL
+                if not dfm.empty:
+                    dfm["insignia"] = ""
+                    if "Precio_CLP" in dfm.columns:
+                        grp_m = ["__prov", "pack seleccionado", "detalle movil"]
+                        idx_min_m = dfm.groupby(grp_m, dropna=False)["Precio_CLP"].idxmin()
+                        dfm.loc[idx_min_m, "insignia"] = "🏷️ Oferta más barata"
+                        dfm = dfm.sort_values(by="Precio_CLP", na_position="last")
+                        dfm = dfm.loc[~dfm.duplicated(subset=grp_m, keep="first")].copy()
+                    else:
+                        dfm = dfm.loc[~dfm.duplicated(subset=["__prov","pack seleccionado","detalle movil"], keep="first")].copy()
 
                 if dfm.empty:
                     st.info("No se encontraron planes móviles (o selecciona 'Fibra + Móvil' tras ejecutar primero Hogar).")
