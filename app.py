@@ -5,7 +5,7 @@ import time
 import json
 import asyncio
 import subprocess
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional  # <-- FIX: añadí Optional
 
 import pandas as pd
 import streamlit as st
@@ -525,7 +525,6 @@ with st.sidebar:
             if sugerencias:
                 lat, lon = sugerencias[idx].get("lat"), sugerencias[idx].get("lon")
             else:
-                # si no hay sugerencias, intenta una búsqueda rápida y toma el 1º
                 q = st.session_state.get("dir_input", "")
                 primer = (buscar_direccion_gratis(q, "cl", 1) or [None])[0]
                 lat, lon = (primer or {}).get("lat"), (primer or {}).get("lon")
@@ -572,7 +571,8 @@ if st.session_state.get("modo_busqueda") == "Hogar":
             "fibra + tv", "fibra + telefonía", "fibra + móvil",
             "fibra + tv + telefonía", "fibra + tv/telefonía",
         ],
-        default=st.session_state.get("servicios_sel_hogar", ["solo internet", "fibra + tv", "fibra + telefonía", "fibra + móvil"]),
+        default=st.session_state.get("servicios_sel_hogar", ["solo internet", "f
+ibra + tv", "fibra + telefonía", "fibra + móvil"]),
         key="servicios_sel_hogar"
     )
 else:
