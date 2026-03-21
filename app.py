@@ -3,7 +3,7 @@ import re
 import sys
 import asyncio
 import subprocess
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -35,7 +35,8 @@ def ensure_chromium_installed():
             stderr=subprocess.STDOUT,
             text=True,
         )
-        # st.code(completed.stdout, language="bash")  # descomenta para ver log
+        # Si necesitas ver el log de instalación, descomenta:
+        # st.code(completed.stdout, language="bash")
     except subprocess.CalledProcessError as e:
         st.error("No fue posible descargar Chromium automáticamente.")
         st.code(e.stdout or "", language="bash")
@@ -69,7 +70,7 @@ def clp_to_int(texto: str) -> int:
 
 
 def format_clp(valor: int) -> str:
-    return f"${valor:,.0f}".replace(",", ".")
+    return f"${valor:,.0f}".replace(",", ".") if valor >= 0 else ""
 
 
 def dump_preview(label: str, text: str, max_chars: int = 5000):
@@ -81,11 +82,62 @@ def dump_preview(label: str, text: str, max_chars: int = 5000):
     st.expander(f"🔎 {label} (primeros {len(preview)} chars)").code(preview, language="html")
 
 
-# ============ Scraper Mundo (async) con diagnóstico ============
+# ============ Heurísticas para extraer planes desde HTML (robusto a cambios de CSS) ============
+PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
+
+def extract_plans_via_regex(html: str, max_items: int = 8) -> List[Tuple[str, str, int]]:
+    """
+    Heurística: busca precios CLP y en una ventana cercana detecta el nombre del plan
+    (líneas tipo 'PLAN 1 ...', 'Fibra 800', etc.).
+    Devuelve lista de (plan, precio_str, precio_int) deduplicada y acotada.
+    """
+    results: List[Tuple[str, str, int]] = []
+
+    for m in PRICE_RE.finditer(html):
+        start = max(m.start() - 160, 0)
+        end = min(m.end() + 160, len(html))
+        ctx = html[start:end]
+
+        # 'PLAN X ...' cerca del precio
+        plan_match = re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,80})", ctx, re.IGNORECASE)
+        if not plan_match:
+            # Alternativa: “Fibra 800”, “Fibra 1G”, “Fibra 10 GIGAS”, etc.
+            plan_match = re.search(r"(Fibra\s*[0-9]+(?:\s*GIGAS?|G|GB|MB)?[^\$<>{}|]{0,40})",
+                                   ctx, re.IGNORECASE)
+
+        plan_name = None
+        if plan_match:
+            plan_name = re.sub(r"\s+", " ", plan_match.group(1)).strip()
+            # Limpia ruido común
+            plan_name = re.sub(r"(POR\s+\d+\s+MESES|SOLO\s+FIBRA|HASTA)\b.*",
+                               "", plan_name, flags=re.IGNORECASE).strip(" -–:|")
+
+        price_str = m.group(0)
+        price_int = clp_to_int(price_str)
+
+        if plan_name and price_int > 0:
+            results.append((plan_name, price_str, price_int))
+        if len(results) >= max_items:
+            break
+
+    # Dedup por (nombre, precio)
+    seen = set()
+    dedup = []
+    for p in results:
+        key = (p[0].lower(), p[2])
+        if key not in seen:
+            seen.add(key)
+            dedup.append(p)
+    return dedup
+
+
+# ============ Scraper Mundo (async) con fallback de URLs ============
 async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True) -> List[Dict]:
     """
-    Extrae los primeros planes de Internet de Mundo.
-    Si no se solicita Internet, retorna lista vacía.
+    Intenta obtener planes de Mundo desde:
+    1) https://mundointernet.cl/p/td/mundo-internet-planes.html  (landing con planes)
+    2) https://www.tumundo.cl/  (home con ofertas)
+    Nota: /internet/ hoy retorna 404 y no se usa. (Se confirmó de forma pública)  # Referencia en explicación
     """
     if not quiere_internet:
         return []
@@ -97,7 +149,7 @@ async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True)
         )
         try:
             context = await browser.new_context(
-                viewport={"width": 390, "height": 844},  # móvil
+                viewport={"width": 390, "height": 844},  # viewport móvil
                 user_agent=(
                     "Mozilla/5.0 (Linux; Android 13; SM-G991B) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -110,134 +162,61 @@ async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True)
                     "Pragma": "no-cache",
                 },
             )
-
             page = await context.new_page()
 
-            resp = await page.goto(
-                "https://www.tumundo.cl/internet/",
-                wait_until="domcontentloaded",
-                timeout=30000
-            )
-            status = resp.status if resp else None
+            # ---------- Intento 1: MundoInternet (planes)
+            url1 = "https://mundointernet.cl/p/td/mundo-internet-planes.html"
+            resp1 = await page.goto(url1, wait_until="domcontentloaded", timeout=30000)
+            status1 = resp1.status if resp1 else None
             if modo_debug:
-                st.caption(f"🌐 Estado HTTP: {status}")
+                st.caption(f"🌐 MundoInternet status: {status1}")
 
-            # Respirito + idle (evita capturar wall/carga parcial)
-            try:
-                await page.wait_for_timeout(1000)
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except:
-                pass
+            html1 = await page.content()
+            plans = extract_plans_via_regex(html1, max_items=8)
 
-            # Opcional: scroll para disparar lazy-load
-            try:
-                await page.mouse.wheel(0, 2000)
-                await page.wait_for_timeout(800)
-            except:
-                pass
-
-            # Selectores candidatos (múltiples variantes)
-            candidate_selectors = [
-                ".card-plan",
-                ".plan-card",
-                ".card--plan",
-                "[class*='plan'] [class*='card']",
-                "[class*='Plan']",
-                "section:has-text('Internet') .card, .cards .card",
-            ]
-
-            cards = []
-            for sel in candidate_selectors:
-                try:
-                    loc = page.locator(sel)
-                    count = await loc.count()
-                    if modo_debug:
-                        st.caption(f"🔎 Selector '{sel}' → {count} nodos")
-                    if count > 0:
-                        for i in range(min(count, 6)):
-                            cards.append(loc.nth(i))
-                        break
-                except Exception:
-                    continue
-
-            if not cards:
+            # ---------- Fallback: Home TuMundo (ofertas) si el anterior no dio resultados
+            if not plans:
+                url2 = "https://www.tumundo.cl/"
+                resp2 = await page.goto(url2, wait_until="domcontentloaded", timeout=30000)
+                status2 = resp2.status if resp2 else None
                 if modo_debug:
-                    try:
-                        png = await page.screenshot(full_page=True)
-                        st.image(png, caption="📸 Screenshot (Mundo)")
-                    except Exception as e:
-                        st.caption(f"No se pudo tomar screenshot: {e}")
-
-                    try:
-                        html = await page.content()
-                        dump_preview("HTML de la página", html, max_chars=6000)
-                    except Exception as e:
-                        st.caption(f"No se pudo obtener HTML: {e}")
-
-                return []
-
-            planes = []
-            for card in cards:
+                    st.caption(f"🌐 TuMundo Home status: {status2}")
                 try:
-                    # Título
-                    posibles_titulos = [
-                        ".title", ".card-title", "h3", "h2", "[class*='title']",
-                        ".plan-title", ".nombre", ".name"
-                    ]
-                    nombre_plan = None
-                    for tsel in posibles_titulos:
-                        if await card.locator(tsel).count() > 0:
-                            nombre_plan = (await card.locator(tsel).first.inner_text()).strip()
-                            break
-                    if not nombre_plan:
-                        nombre_plan = (await card.inner_text()).splitlines()[0].strip()
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                    await page.mouse.wheel(0, 1800)
+                    await page.wait_for_timeout(800)
+                except:
+                    pass
+                html2 = await page.content()
+                plans = extract_plans_via_regex(html2, max_items=8)
 
-                    # Precio
-                    posibles_precios = [
-                        "[class*='precio']", "[class*='price']", ".price", ".precio",
-                        "strong:has-text('$')", "span:has-text('$')"
-                    ]
-                    precio_line = ""
-                    for psel in posibles_precios:
-                        if await card.locator(psel).count() > 0:
-                            txt = (await card.locator(psel).first.inner_text()).strip()
-                            if "$" in txt or "CLP" in txt:
-                                precio_line = txt
-                                break
-                    if not precio_line:
-                        raw = await card.inner_text()
-                        for l in [l.strip() for l in raw.splitlines() if l.strip()]:
-                            if "$" in l:
-                                precio_line = l
-                                break
-
-                    precio_num = clp_to_int(precio_line)
-                    precio_fmt = format_clp(precio_num) if precio_num >= 0 else precio_line
-
-                    planes.append({
-                        "Compañía": "Mundo",
-                        "Tipo": "Fibra",
-                        "Plan": nombre_plan,
-                        "Precio": precio_fmt,
-                        "Precio_CLP": precio_num
-                    })
-                except Exception:
-                    continue
-
-            planes = [p for p in planes if p.get("Precio")]
-            if any(p["Precio_CLP"] >= 0 for p in planes):
-                planes.sort(key=lambda r: (r["Precio_CLP"] if r["Precio_CLP"] >= 0 else 9_999_999))
-
-            if not planes and modo_debug:
+            if modo_debug and not plans:
                 try:
                     png = await page.screenshot(full_page=True)
-                    st.image(png, caption="📸 Screenshot (sin planes)")
-                    html = await page.content()
-                    dump_preview("HTML de la página (sin planes)", html)
-                except Exception:
+                    st.image(png, caption="📸 Screenshot (Mundo)")
+                except Exception as e:
+                    st.caption(f"No se pudo tomar screenshot: {e}")
+
+                try:
+                    snippet = (await page.content())[:6000]
+                    dump_preview("HTML capturado (primeros 6000 chars)", snippet, max_chars=6000)
+                except:
                     pass
 
-            return planes
+            # Estructura de salida
+            out: List[Dict] = []
+            for nombre_plan, precio_str, precio_int in plans:
+                out.append({
+                    "Compañía": "Mundo",
+                    "Tipo": "Fibra",
+                    "Plan": nombre_plan,
+                    "Precio": format_clp(precio_int) or precio_str,
+                    "Precio_CLP": precio_int
+                })
+
+            # Orden por precio (si hay numérico)
+            out.sort(key=lambda r: (r["Precio_CLP"] if r["Precio_CLP"] > 0 else 99_999_999))
+            return out
 
         finally:
             await browser.close()
@@ -250,7 +229,7 @@ with st.sidebar:
     dir_completa = st.text_input("Dirección y Comuna")
 
 
-# ============ Preferencias (AQUÍ se define quiere_internet) ============
+# ============ Preferencias ============
 st.subheader("¿Qué servicios necesitas?")
 col1, col2 = st.columns(2)
 with col1:
@@ -261,7 +240,7 @@ with col2:
     quiere_fija = st.checkbox("☎️ Telefonía Fija")
 
 
-# ============ Acción (botón) ============
+# ============ Acción ============
 if st.button("Buscar Ofertas Reales 🚀", use_container_width=True):
     if not rut or not dir_completa:
         st.error("Por favor completa tu RUT y Dirección en la barra lateral.")
@@ -281,7 +260,8 @@ if st.button("Buscar Ofertas Reales 🚀", use_container_width=True):
                 df = pd.DataFrame(resultados_mundo)
 
                 if df.empty:
-                    st.info("No se encontraron planes (cambió el DOM o hubo protección anti-bot). Revisa los diagnósticos arriba 👆.")
+                    st.info("No se encontraron planes (cambió el DOM o hubo protección anti-bot). "
+                            "Revisa los diagnósticos arriba 👆.")
                 else:
                     mostrar = df[["Compañía", "Tipo", "Plan", "Precio"]]
                     st.success("¡Ofertas encontradas!")
@@ -289,3 +269,7 @@ if st.button("Buscar Ofertas Reales 🚀", use_container_width=True):
 
             except Exception as e:
                 st.error(f"Falla al consultar Mundo: {e}")
+                st.caption(
+                    "Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez. "
+                    "La primera descarga de Chromium puede tardar un poco."
+                )
