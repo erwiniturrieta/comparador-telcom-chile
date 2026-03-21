@@ -695,7 +695,7 @@ def _limpiar_filtros():
     st.session_state["incluir_movistar"] = True
     st.session_state["incluir_entel"] = True
     st.session_state["incluir_wom"] = True
-    st.session_state["incluir_vtr"] = False
+    st.session_state["incluir_vtr"] = True
     st.session_state["servicios_sel_hogar"] = ["solo internet", "fibra + tv", "fibra + telefonía", "fibra + móvil"]
     st.session_state["servicios_sel_movil"] = ["solo internet móvil"]
     st.session_state["fibra_por_proveedor"] = {}
@@ -738,7 +738,7 @@ with st.sidebar:
     st.checkbox("Movistar", value=True, key="incluir_movistar")
     st.checkbox("Entel", value=True, key="incluir_entel")
     st.checkbox("WOM", value=True, key="incluir_wom")
-    st.checkbox("VTR", value=False, key="incluir_vtr")
+    st.checkbox("VTR", value=True, key="incluir_vtr")
 
     st.button("🧽 Limpiar filtros", on_click=_limpiar_filtros)
 
