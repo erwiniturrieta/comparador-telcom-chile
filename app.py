@@ -729,7 +729,7 @@ with st.sidebar:
     st.text_input(
         "Dirección (auto-validación y normalización)",
         key="dir_input",
-        placeholder="calle y número, comuna (ej: San Óscar 2807 Maipú)",
+        placeholder="calle y número, comuna (ej: calle 1234 comuna)",
         on_change=on_dir_change_autovalidate
     )
     st.caption(st.session_state.get("dir_status", "Escribe una dirección y presiona Enter"))
