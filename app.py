@@ -400,12 +400,9 @@ def parse_direccion_chile(q: str) -> Tuple[str, str, str]:
 
 def on_dir_change_autovalidate():
     """
-    1) Intenta parsear 'calle numero [comuna]' y hace búsqueda ESTRUCTURADA.
-    2) Si encuentra coincidencia EXACTA (mismo house_number), normaliza (display_name) y marca ✅.
-    3) Si NO hay exacta, usa la MEJOR COINCIDENCIA (vía/barrio/comuna) y:
-        - escribe igualmente en el input (para avanzar con planes),
-        - marca estado ⚠️ 'Dirección aproximada'.
-    4) Como último recurso, intenta forward search (q=...).
+    Valida y normaliza dirección automáticamente al cambiar el input:
+    - Busca en Nominatim (gratis) con countrycodes=cl.
+    - Si hay resultado, normaliza (display_name) vía reverse y lo escribe en el input.
     """
     q = (st.session_state.get("dir_input") or "").strip()
     if len(q) < 5:
@@ -414,31 +411,28 @@ def on_dir_change_autovalidate():
         return
 
     try:
-        calle, numero, comuna = parse_direccion_chile(q)
-        best_exact = None
-        best_any = None
-
-        # --- 1) Búsqueda ESTRUCTURADA (prioritaria)
-        if calle and numero:
-            cand = buscar_direccion_estructurada(calle, numero, comuna)
-            if cand:
-                best_any = cand  # al menos tenemos una (puede ser la vía)
-                addr = cand.get("address", {})
-                hn = (addr.get("house_number") or "").strip()
-                if hn == numero or f" {numero} " in f" {cand.get('display_name','')} ":
-                    best_exact = cand
-
-        # --- 2) Fallback: forward search difuso (q)
-        if not best_any:
-            sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)
-            st.session_state["dir_sugerencias"] = sug or []
-            if sug:
-                best_any = sug[0]
-
-        # Si no hay nada, informar y salir
-        if not best_any:
-            st.session_state["dir_status"] = "❌ No se encontró ninguna coincidencia"
+        # 1) forward search (gratis) con límites/headers adecuados
+        sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)  # 1.05s de pausa interna
+        st.session_state["dir_sugerencias"] = sug or []
+        if not sug:
+            st.session_state["dir_status"] = "❌ No se encontró la dirección"
             return
+
+        # 2) toma la mejor coincidencia (primera) y normaliza por reverse
+        best = sug[0]
+        lat, lon = best.get("lat"), best.get("lon")
+        if not (lat and lon):
+            st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"
+            return
+
+        rev = normalizar_direccion_por_latlon(lat, lon)  # incluye 1.05s de pausa
+        if rev and "display_name" in rev:
+            st.session_state["dir_input"] = rev["display_name"]  # auto-normaliza en el input
+            st.session_state["dir_status"] = "✅ Dirección validada y normalizada"
+        else:
+            st.session_state["dir_status"] = "❌ No se pudo normalizar (reverse)"
+    except Exception:
+        st.session_state["dir_status"] = "⚠️ Error validando con Nominatim"
 
         # --- 3) Normalizar por reverse para estandarizar etiqueta
         lat, lon = best_any.get("lat"), best_any.get("lon")
