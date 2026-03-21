@@ -44,7 +44,7 @@ def ensure_chromium_installed():
     except subprocess.CalledProcessError as e:
         st.error("No fue posible descargar Chromium automáticamente.")
         # Muestra el log completo que emite playwright (para entender el motivo real)
-        st.code(e.stdout or "", language="bash")
+        #st.code(e.stdout or "", language="bash")
         # Re-lanza para que el bloque llamador entre al except y lo reporte
         raise
 
