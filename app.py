@@ -22,16 +22,12 @@ def ensure_chromium_installed():
     Descarga Chromium SOLO una vez por sesión del servidor.
     - No usa '--with-deps' (evita sudo en Streamlit Cloud).
     - Ubica los binarios en el HOME del usuario para evitar permisos.
-    - Quita '--retry' (no soportado en tu entorno).
     """
     os.environ.setdefault(
         "PLAYWRIGHT_BROWSERS_PATH",
         os.path.expanduser("~/.cache/ms-playwright")
     )
-
     try:
-        # Instalación de navegadores (sin dependencias del SO)
-        # Importante: SIN '--with-deps' y SIN '--retry'
         completed = subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
             check=True,
@@ -39,13 +35,10 @@ def ensure_chromium_installed():
             stderr=subprocess.STDOUT,
             text=True,
         )
-        # Puedes inspeccionar el log si lo necesitas:
-        # st.code(completed.stdout, language="bash")
+        # st.code(completed.stdout, language="bash")  # descomenta para ver log
     except subprocess.CalledProcessError as e:
         st.error("No fue posible descargar Chromium automáticamente.")
-        # Muestra el log completo que emite playwright (para entender el motivo real)
-        #st.code(e.stdout or "", language="bash")
-        # Re-lanza para que el bloque llamador entre al except y lo reporte
+        st.code(e.stdout or "", language="bash")
         raise
 
 
@@ -79,87 +72,8 @@ def format_clp(valor: int) -> str:
     return f"${valor:,.0f}".replace(",", ".")
 
 
-# ============ Scraper Mundo (async) ============
-async def buscar_en_mundo(quiere_internet: bool) -> List[Dict]:
-    """
-    Extrae los primeros planes de Internet de Mundo.
-    Si no se solicita Internet, retorna lista vacía.
-    """
-    if not quiere_internet:
-        return []
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
-        )
-        try:
-            page = await browser.new_page(
-                user_agent=(
-                    "Mozilla/5.0 (Linux; Android 13; SM-G991B) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/121.0.0.0 Mobile Safari/537.36"
-                )
-            )
-
-            await page.goto(
-                "https://www.tumundo.cl/internet/",
-                wait_until="domcontentloaded",
-                timeout=30000
-            )
-
-            # Selectores con fallbacks (ajusta según DOM real si cambia)
-            selectors = [
-                ".card-plan",
-                ".plan-card",
-                "[class*='plan'] [class*='card']"
-            ]
-
-            cards = []
-            for sel in selectors:
-                try:
-                    await page.wait_for_selector(sel, timeout=8000)
-                    cards = await page.query_selector_all(sel)
-                    if cards:
-                        break
-                except PlaywrightTimeout:
-                    continue
-
-            if not cards:
-                return []
-
-            planes = []
-            for card in cards[:5]:  # límite para rapidez y consumo
-                texto = (await card.inner_text()).strip()
-                lineas = [l.strip() for l in texto.splitlines() if l.strip()]
-                nombre_plan = lineas[0] if lineas else "Plan"
-                precio_line = next((l for l in lineas[1:5] if "$" in l or "CLP" in l), "")
-                precio_num = clp_to_int(precio_line)
-                precio_fmt = format_clp(precio_num) if precio_num >= 0 else precio_line
-
-                planes.append({
-                    "Compañía": "Mundo",
-                    "Tipo": "Fibra",
-                    "Plan": nombre_plan,
-                    "Precio": precio_fmt,
-                    "Precio_CLP": precio_num
-                })
-
-            # Ordenar por precio válido
-            planes.sort(key=lambda r: (r["Precio_CLP"] if r["Precio_CLP"] >= 0 else 9_999_999))
-            return planes
-
-        finally:
-            await browser.close()
-
-
-# ============ Sidebar ============
-with st.sidebar:
-    st.header("Configuración")
-    rut = st.text_input("RUT (para factibilidad)")
-    dir_completa = st.text_input("Dirección y Comuna")
-# ---------- NUEVO: util para mostrar fragmentos en Streamlit ----------
 def dump_preview(label: str, text: str, max_chars: int = 5000):
+    """Muestra un recorte de HTML/Texto para diagnóstico."""
     if not text:
         st.caption(f"{label}: (vacío)")
         return
@@ -168,7 +82,11 @@ def dump_preview(label: str, text: str, max_chars: int = 5000):
 
 
 # ============ Scraper Mundo (async) con diagnóstico ============
-async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> List[Dict]:
+async def buscar_en_mundo(quiere_internet: bool = True, modo_debug: bool = True) -> List[Dict]:
+    """
+    Extrae los primeros planes de Internet de Mundo.
+    Si no se solicita Internet, retorna lista vacía.
+    """
     if not quiere_internet:
         return []
 
@@ -195,30 +113,30 @@ async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> Lis
 
             page = await context.new_page()
 
-            # Métricas simples de red
-            req_count = 0
-            page.on("requestfinished", lambda _: None)  # attach to keep alive
-            page.on("request", lambda _: None)
-
             resp = await page.goto(
                 "https://www.tumundo.cl/internet/",
                 wait_until="domcontentloaded",
                 timeout=30000
             )
-
             status = resp.status if resp else None
             if modo_debug:
                 st.caption(f"🌐 Estado HTTP: {status}")
 
-            # Esperas progresivas: primero DOM, luego ocluye loaders, luego idle
+            # Respirito + idle (evita capturar wall/carga parcial)
             try:
-                # Intenta esperar por un contenedor amplio de planes (varios fallbacks)
-                await page.wait_for_timeout(1000)  # respiro corto
+                await page.wait_for_timeout(1000)
                 await page.wait_for_load_state("networkidle", timeout=15000)
             except:
                 pass
 
-            # Selectores candidatos (multiples variantes típicas)
+            # Opcional: scroll para disparar lazy-load
+            try:
+                await page.mouse.wheel(0, 2000)
+                await page.wait_for_timeout(800)
+            except:
+                pass
+
+            # Selectores candidatos (múltiples variantes)
             candidate_selectors = [
                 ".card-plan",
                 ".plan-card",
@@ -228,9 +146,7 @@ async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> Lis
                 "section:has-text('Internet') .card, .cards .card",
             ]
 
-            # Usa locator (más robusto que query_selector_all)
             cards = []
-            last_err = None
             for sel in candidate_selectors:
                 try:
                     loc = page.locator(sel)
@@ -238,19 +154,15 @@ async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> Lis
                     if modo_debug:
                         st.caption(f"🔎 Selector '{sel}' → {count} nodos")
                     if count > 0:
-                        # toma hasta 6 elementos reales
                         for i in range(min(count, 6)):
                             cards.append(loc.nth(i))
                         break
-                except Exception as e:
-                    last_err = e
+                except Exception:
                     continue
 
-            # Si no hay tarjetas, volcamos diagnóstico visual
             if not cards:
                 if modo_debug:
                     try:
-                        # Screenshot para ver si hay challenge o página vacía
                         png = await page.screenshot(full_page=True)
                         st.image(png, caption="📸 Screenshot (Mundo)")
                     except Exception as e:
@@ -264,11 +176,10 @@ async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> Lis
 
                 return []
 
-            # Extracción heurística dentro de cada card
             planes = []
             for card in cards:
                 try:
-                    # Título / plan
+                    # Título
                     posibles_titulos = [
                         ".title", ".card-title", "h3", "h2", "[class*='title']",
                         ".plan-title", ".nombre", ".name"
@@ -295,7 +206,6 @@ async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> Lis
                                 break
                     if not precio_line:
                         raw = await card.inner_text()
-                        # busca la primera línea que tenga un $
                         for l in [l.strip() for l in raw.splitlines() if l.strip()]:
                             if "$" in l:
                                 precio_line = l
@@ -314,14 +224,10 @@ async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> Lis
                 except Exception:
                     continue
 
-            # Filtra tarjetas que no tengan precio válido (opcional)
             planes = [p for p in planes if p.get("Precio")]
-
-            # Orden por precio si hay números
             if any(p["Precio_CLP"] >= 0 for p in planes):
                 planes.sort(key=lambda r: (r["Precio_CLP"] if r["Precio_CLP"] >= 0 else 9_999_999))
 
-            # Dump adicional si quedó vacío
             if not planes and modo_debug:
                 try:
                     png = await page.screenshot(full_page=True)
@@ -337,20 +243,41 @@ async def buscar_en_mundo(quiere_internet: bool, modo_debug: bool = True) -> Lis
             await browser.close()
 
 
+# ============ Sidebar ============
+with st.sidebar:
+    st.header("Configuración")
+    rut = st.text_input("RUT (para factibilidad)")
+    dir_completa = st.text_input("Dirección y Comuna")
+
+
+# ============ Preferencias (AQUÍ se define quiere_internet) ============
+st.subheader("¿Qué servicios necesitas?")
+col1, col2 = st.columns(2)
+with col1:
+    quiere_internet = st.checkbox("🌐 Internet Fibra", value=True)
+    quiere_movil = st.checkbox("📱 Telefonía Móvil")
+with col2:
+    quiere_tv = st.checkbox("📺 TV Cable")
+    quiere_fija = st.checkbox("☎️ Telefonía Fija")
+
+
 # ============ Acción (botón) ============
 if st.button("Buscar Ofertas Reales 🚀", use_container_width=True):
     if not rut or not dir_completa:
         st.error("Por favor completa tu RUT y Dirección en la barra lateral.")
     else:
+        # 1) Descargar binarios de Chromium (cacheado, sin sudo)
         try:
             ensure_chromium_installed()
         except Exception:
             st.stop()
 
+        # 2) Consultar Mundo con modo debug activo
         with st.spinner("Consultando Mundo Pacífico..."):
             try:
-                # Activa modo_debug=True para ver screenshot/HTML en la app
-                resultados_mundo = run_async(buscar_en_mundo(quiere_internet, modo_debug=True))
+                resultados_mundo = run_async(
+                    buscar_en_mundo(quiere_internet=quiere_internet, modo_debug=True)
+                )
                 df = pd.DataFrame(resultados_mundo)
 
                 if df.empty:
