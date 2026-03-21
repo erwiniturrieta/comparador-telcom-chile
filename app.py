@@ -5,7 +5,8 @@
 # - Modo exclusivo: Hogar o Móvil
 # - Scrapers: Mundo / Movistar / Entel / WOM (+ VTR fallback) para Hogar; Movistar/Entel/WOM para Móvil
 # - Botón "Limpiar filtros" (restaura defaults y limpia cachés)
-# - NUEVO: velocidad (Mbps/Gbps) también se extrae desde el CONTEXTO HTML (speed_hint)
+# - FIX: velocidad (Mbps/Gbps) también se extrae desde el CONTEXTO HTML (speed_hint)
+# - FIX: no se filtran filas sin nombre cuando traen speed_hint (ya no se pierden velocidades)
 
 import os
 import re
@@ -73,6 +74,78 @@ def run_async(coro):
 # =================== Heurísticas / Regex ===================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
 
+# ---- NUEVO: parser robusto de velocidad ----
+# Soporta: "600 Mb/s", "600 Mbps", "600 Mb", "600 Mega(s)", "1 Giga", "1 Gb", "1.5 Gbps", "hasta 940 Mbps"
+GIGA_RE = re.compile(r"\b(\d+(?:[.,]\d+)?)\s*(?:g(?:ig?a)?|gb(?:ps)?)\b", re.IGNORECASE)
+MBPS_RE = re.compile(r"\b(\d{2,5})\s*(?:m(?:b(?:ps)?|b\/s)?|mega?s?)\b", re.IGNORECASE)
+HASTA_RE = re.compile(r"\bhasta\b\s+(\d+(?:[.,]\d+)?)\s*(?:mbps|mb\/s|mb|mega?s?|g(?:ig?a)?|gb(?:ps)?)", re.IGNORECASE)
+
+def normalize_gbps(num_str: str) -> str:
+    # Convierte "1" o "1.5" a "1 Gbps" o "1.5 Gbps"
+    val = num_str.replace(",", ".")
+    try:
+        f = float(val)
+    except:
+        return ""
+    # evita "0 Gbps"
+    if f <= 0:
+        return ""
+    # 1.0 -> "1 Gbps"; 1.5 -> "1.5 Gbps"
+    return f"{int(f) if f.is_integer() else f} Gbps"
+
+def normalize_mbps(num_str: str) -> str:
+    try:
+        n = int(num_str)
+    except:
+        return ""
+    if n <= 0:
+        return ""
+    return f"{n} Mbps"
+
+def extract_speed_from_text(text: str) -> str:
+    """Intenta extraer velocidad desde texto libre."""
+    if not text:
+        return ""
+    t = text.lower()
+
+    # 1) "hasta X ..."
+    m_h = HASTA_RE.search(t)
+    if m_h:
+        num = m_h.group(1)
+        unit_chunk = t[m_h.end(): m_h.end()+10]  # pequeña ventana por si la unidad quedó fuera del grupo
+        # Determinar si era Giga o Mega (por el propio match ya lo trae, pero reforzamos)
+        if re.search(r"g(?:ig?a)?|gb(?:ps)?", m_h.group(0), re.IGNORECASE):
+            sp = normalize_gbps(num)
+            if sp:
+                return sp
+        sp = normalize_mbps(num)
+        if sp:
+            return sp
+
+    # 2) Giga / Gb / Gbps
+    m_g = GIGA_RE.search(t)
+    if m_g:
+        sp = normalize_gbps(m_g.group(1))
+        if sp:
+            return sp
+
+    # 3) Mb / Mbps / Mb/s / Mega(s)
+    m_m = MBPS_RE.search(t)
+    if m_m:
+        val = int(m_m.group(1))
+        # 1000,1500,2000... → interpretamos como Gbps (redondeando por múltiplos de 1000)
+        if val in (1000, 1500, 2000, 3000, 5000, 10000):
+            g = val / 1000.0
+            return f"{int(g) if g.is_integer() else g} Gbps"
+        return f"{val} Mbps"
+
+    # 4) casos especiales "gamer" ~ 940 Mbps
+    if "gamer" in t:
+        return "940 Mbps"
+
+    return ""
+
+
 def clp_to_int(texto: str) -> int:
     if not texto:
         return -1
@@ -83,15 +156,15 @@ def format_clp(valor: int) -> str:
     return f"${valor:,.0f}".replace(",", ".") if valor >= 0 else ""
 
 def infer_speed(plan: str) -> str:
-    """Devuelve '600 Mbps', '1 Gbps', etc., si detecta en el nombre del plan."""
+    """Primero prueba con parser robusto; si falla, aplica heurísticas antiguas."""
+    sp = extract_speed_from_text(plan)
+    if sp:
+        return sp
+
+    # Heurística previa (respaldo)
     if not plan:
         return ""
     txt = plan.lower()
-
-    m_gigas = re.search(r"(\d+)\s*giga?s?", txt)
-    if m_gigas:
-        val = int(m_gigas.group(1))
-        return f"{val} Gbps" if val != 1 else "1 Gbps"
 
     m_gbps = re.search(r"\b(10000|5000|3000|2000|1000)\b", txt)
     if m_gbps:
@@ -185,18 +258,16 @@ def extract_plans_via_regex(html: str, max_items: int = 24) -> List[Tuple[str, s
     results: List[Tuple[str, str, int, str]] = []
 
     for m in PRICE_RE.finditer(html):
-        start = max(m.start() - 260, 0)
-        end = min(m.end() + 260, len(html))
+        start = max(m.start() - 320, 0)       # ventana un poco mayor
+        end = min(m.end() + 320, len(html))
         ctx = html[start:end]
 
         # Nombre cercano
         plan_match = (
-            re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,120})", ctx, re.IGNORECASE)
+            re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,140})", ctx, re.IGNORECASE)
             or re.search(r"((?:Internet\s*)?Fibra\s*(?:Gamer|Giga|[0-9]{2,4})\s*(?:Megas?|Mb|Mbps|Gigas?)?)",
                          ctx, re.IGNORECASE)
             or re.search(r"((?:Fibra|Internet)\s*[0-9]{2,4}\s*(?:Mb|Mbps))", ctx, re.IGNORECASE)
-            or re.search(r"(5G\s*Libre\s*(?:Full|Pro|Ultra)?\s*\d{0,4}\s*GB?)", ctx, re.IGNORECASE)
-            or re.search(r"(Plan\s*(?:\d{2,4}|Gigas\s*Libres).{0,40})", ctx, re.IGNORECASE)
             or re.search(r"(TV\s*(?:Lite\+|Full\+|Online)?)", ctx, re.IGNORECASE)
             or re.search(r"(Telefon(?:ía|ia)\s*fija)", ctx, re.IGNORECASE)
         )
@@ -208,28 +279,7 @@ def extract_plans_via_regex(html: str, max_items: int = 24) -> List[Tuple[str, s
                                "", plan_name, flags=re.IGNORECASE).strip(" -–:|.")
 
         # Pista de velocidad desde el contexto (aunque no esté en el nombre)
-        speed_hint = ""
-        # 1) 'X Giga / Gigas' -> Gbps
-        m_giga = re.search(r"\b(\d{1,2})\s*giga?s?\b", ctx, re.IGNORECASE)
-        if m_giga:
-            val = int(m_giga.group(1))
-            speed_hint = f"{val} Gbps" if val != 1 else "1 Gbps"
-        else:
-            # 2) 'X Mb/Mbps/Megas' (incluye 940, 1000, 2000, 3000, 5000, 10000)
-            m_mbps = re.search(
-                r"\b(150|200|300|400|500|560|600|700|800|900|940|1000|1500|2000|3000|5000|10000)\s*(?:mbps|mb|megas?)\b",
-                ctx, re.IGNORECASE
-            )
-            if m_mbps:
-                num = int(m_mbps.group(1))
-                if num in (1000, 1500, 2000, 3000, 5000, 10000):
-                    speed_hint = f"{num//1000} Gbps" if num % 1000 == 0 else f"{num} Mbps"
-                else:
-                    speed_hint = f"{num} Mbps"
-            else:
-                # 3) casos especiales “Gamer” → comúnmente 940
-                if re.search(r"gamer", ctx, re.IGNORECASE):
-                    speed_hint = "940 Mbps"
+        speed_hint = extract_speed_from_text(ctx)
 
         price_str = m.group(0)
         price_int = clp_to_int(price_str)
@@ -237,7 +287,7 @@ def extract_plans_via_regex(html: str, max_items: int = 24) -> List[Tuple[str, s
         if plan_name and price_int > 0:
             results.append((plan_name, price_str, price_int, speed_hint))
         elif price_int > 0:
-            # A falta de nombre, guarda con speed_hint si existe
+            # A falta de nombre, guarda con speed_hint si existe (o igual para tener el precio)
             results.append(("", price_str, price_int, speed_hint))
 
         if len(results) >= max_items:
@@ -421,17 +471,22 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Tuple[str, s
                         pass
                     html = await page.content()
                     found = extract_plans_via_regex(html, max_items=24)
-                    found = [f for f in found if re.search(filters_regex, f[0], re.IGNORECASE)]
-                    results.extend(found)
+                    # ---- FIX: no descartar si no hay nombre pero SÍ hay speed_hint ----
+                    kept = []
+                    for f in found:
+                        plan_name, _, _, speed_hint = f
+                        if (plan_name and re.search(filters_regex, plan_name, re.IGNORECASE)) or speed_hint:
+                            kept.append(f)
+                    results.extend(kept)
                 except Exception:
                     continue
-            # Dedup (ya viene deduplicado desde extractor, pero por seguridad)
+            # Dedup
             seen, dedup = set(), []
-            for plan in results:
-                k = (plan[0].lower(), plan[2], plan[3].lower() if plan[3] else "")
+            for plan, ps, pi, sh in results:
+                k = (plan.lower(), pi, sh.lower() if sh else "")
                 if k not in seen:
                     seen.add(k)
-                    dedup.append(plan)
+                    dedup.append((plan, ps, pi, sh))
             return dedup
         finally:
             await browser.close()
