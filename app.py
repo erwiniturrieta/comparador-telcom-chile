@@ -1,7 +1,8 @@
+import os
 import re
+import sys
 import asyncio
 import subprocess
-import sys
 from typing import List, Dict
 
 import pandas as pd
@@ -9,32 +10,54 @@ import streamlit as st
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 
-# ---------- Configuración de página ----------
+# ============ Configuración de página ============
 st.set_page_config(page_title="Comparador Chile", page_icon="📡")
 st.title("📡 Mi Comparador Telecom")
 
 
-# ---------- Utilidades ----------
+# ============ Utilidades ============
 @st.cache_resource(show_spinner=False)
 def ensure_chromium_installed():
     """
-    Descarga Chromium y dependencias SOLO una vez por sesión de servidor.
-    En algunas plataformas esto puede tardar ~100-200 MB la primera vez.
+    Descarga Chromium SOLO una vez por sesión del servidor.
+    - No usa '--with-deps' (evita sudo en Streamlit Cloud).
+    - Fuerza una ruta de cache dentro del home del usuario.
     """
+    os.environ.setdefault(
+        "PLAYWRIGHT_BROWSERS_PATH",
+        os.path.expanduser("~/.cache/ms-playwright")
+    )
     try:
-        # "--with-deps" instala librerías del sistema cuando la plataforma lo permite.
-        # Si tu plataforma no lo soporta, elimina "--with-deps".
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+        res = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium", "--retry", "3"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
+        # st.text(res.stdout)  # descomenta si quieres ver el log de instalación
     except subprocess.CalledProcessError as e:
-        st.warning("No fue posible instalar Chromium automáticamente. "
-                   "Si estás en Streamlit Cloud y falla, podemos mover el scraping a un microservicio.")
-        st.text(e.stdout)
+        st.error("No fue posible descargar Chromium automáticamente.")
+        st.code(e.stdout or "", language="bash")
+        raise
+
+
+def run_async(coro):
+    """Ejecuta una corrutina de forma segura (funciona aunque haya o no loop activo)."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            new_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(new_loop)
+                return new_loop.run_until_complete(coro)
+            finally:
+                new_loop.close()
+                asyncio.set_event_loop(loop)
+        else:
+            return loop.run_until_complete(coro)
+    except RuntimeError:
+        return asyncio.run(coro)
 
 
 def clp_to_int(texto: str) -> int:
@@ -49,16 +72,15 @@ def format_clp(valor: int) -> str:
     return f"${valor:,.0f}".replace(",", ".")
 
 
-# ---------- Scraper Mundo (async) ----------
+# ============ Scraper Mundo (async) ============
 async def buscar_en_mundo(quiere_internet: bool) -> List[Dict]:
     """
     Extrae los primeros planes de Internet de Mundo.
-    Si no se solicita Internet, retorna lista vacía (puedes extender a TV/Combos).
+    Si no se solicita Internet, retorna lista vacía.
     """
     if not quiere_internet:
         return []
 
-    # Lanzamiento en headless, con flags útiles en contenedores
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -73,47 +95,50 @@ async def buscar_en_mundo(quiere_internet: bool) -> List[Dict]:
                 )
             )
 
-            await page.goto("https://www.tumundo.cl/internet/", wait_until="domcontentloaded", timeout=30000)
+            await page.goto(
+                "https://www.tumundo.cl/internet/",
+                wait_until="domcontentloaded",
+                timeout=30000
+            )
 
-            # Espera por tarjetas de planes (selector principal + fallback)
+            # Selectores con fallbacks (ajusta según DOM real si cambia)
             selectors = [
-                ".card-plan",                 # hipotético
-                ".plan-card",                 # fallback común
-                "[class*='plan'] [class*='card']"  # fallback genérico
+                ".card-plan",
+                ".plan-card",
+                "[class*='plan'] [class*='card']"
             ]
 
             cards = []
-            last_error = None
             for sel in selectors:
                 try:
                     await page.wait_for_selector(sel, timeout=8000)
                     cards = await page.query_selector_all(sel)
                     if cards:
                         break
-                except PlaywrightTimeout as te:
-                    last_error = te
+                except PlaywrightTimeout:
+                    continue
 
             if not cards:
-                raise RuntimeError(f"No se encontraron tarjetas de planes. Último error: {last_error}")
+                return []
 
             planes = []
-            for card in cards[:5]:  # limita para rapidez
+            for card in cards[:5]:  # límite para rapidez y consumo
                 texto = (await card.inner_text()).strip()
                 lineas = [l.strip() for l in texto.splitlines() if l.strip()]
-                # heurística: primera línea nombre, siguiente(s) precio
                 nombre_plan = lineas[0] if lineas else "Plan"
-                precio_line = next((l for l in lineas[1:4] if "$" in l or "CLP" in l), "")
+                precio_line = next((l for l in lineas[1:5] if "$" in l or "CLP" in l), "")
                 precio_num = clp_to_int(precio_line)
+                precio_fmt = format_clp(precio_num) if precio_num >= 0 else precio_line
 
                 planes.append({
                     "Compañía": "Mundo",
+                    "Tipo": "Fibra",
                     "Plan": nombre_plan,
-                    "Precio_CLP": precio_num,
-                    "Precio": format_clp(precio_num) if precio_num >= 0 else precio_line,
-                    "Tipo": "Fibra"
+                    "Precio": precio_fmt,
+                    "Precio_CLP": precio_num
                 })
 
-            # ordena por precio válido
+            # Ordenar por precio válido
             planes.sort(key=lambda r: (r["Precio_CLP"] if r["Precio_CLP"] >= 0 else 9_999_999))
             return planes
 
@@ -121,13 +146,14 @@ async def buscar_en_mundo(quiere_internet: bool) -> List[Dict]:
             await browser.close()
 
 
-# ---------- Sidebar ----------
+# ============ Sidebar ============
 with st.sidebar:
     st.header("Configuración")
     rut = st.text_input("RUT (para factibilidad)")
     dir_completa = st.text_input("Dirección y Comuna")
 
-# ---------- Preferencias ----------
+
+# ============ Preferencias ============
 st.subheader("¿Qué servicios necesitas?")
 col1, col2 = st.columns(2)
 with col1:
@@ -137,25 +163,31 @@ with col2:
     quiere_tv = st.checkbox("📺 TV Cable")
     quiere_fija = st.checkbox("☎️ Telefonía Fija")
 
-# ---------- Acción ----------
+
+# ============ Acción ============
 if st.button("Buscar Ofertas Reales 🚀", use_container_width=True):
     if not rut or not dir_completa:
         st.error("Por favor completa tu RUT y Dirección en la barra lateral.")
     else:
+        # 1) Descargar binarios de Chromium (cacheado, sin sudo)
         ensure_chromium_installed()
 
+        # 2) Consultar Mundo
         with st.spinner("Consultando Mundo Pacífico..."):
             try:
-                # Ejecuta la corrutina (en Streamlit suele ser seguro usar asyncio.run)
-                resultados_mundo = asyncio.run(buscar_en_mundo(quiere_internet))
+                resultados_mundo = run_async(buscar_en_mundo(quiere_internet))
                 df = pd.DataFrame(resultados_mundo)
 
                 if df.empty:
-                    st.info("No se encontraron planes para los filtros seleccionados.")
+                    st.info("No se encontraron planes (cambió el DOM o hubo protección anti-bot).")
                 else:
-                    # Muestra columnas ordenadas y formateadas
                     mostrar = df[["Compañía", "Tipo", "Plan", "Precio"]]
                     st.success("¡Ofertas encontradas!")
                     st.dataframe(mostrar, use_container_width=True)
+
             except Exception as e:
                 st.error(f"Falla al consultar Mundo: {e}")
+                st.caption(
+                    "Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez. "
+                    "La primera descarga de Chromium puede tardar un poco."
+                )
