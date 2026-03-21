@@ -5,7 +5,7 @@
 # - Solo Hogar: listas blancas de URLs y filtro negativo (empresa/pyme/corporativo/convenios)
 # - Velocidad: extraída del nombre o del CONTEXTO HTML (ventana ±1200)
 # - DEDUP + INSIGNIA: marca "🏷️ Oferta más barata" y queda solo la ganadora
-# - Toggle "Modo desarrollador": oculta/mostrar toolbar, Share, GitHub, etc.
+# - Toggle "Modo desarrollador": oculta/mostrar toolbar, Share, GitHub, "Manage app", etc.
 
 import os
 import re
@@ -26,10 +26,8 @@ import requests
 st.set_page_config(
     page_title="Comparador Chile",
     page_icon="📡",
-    # Oculta los ítems del menú por defecto (ayuda/sobre/bug)
     menu_items={"Get Help": None, "Report a bug": None, "About": None},
 )
-
 st.title("📡 Mi Comparador Telecom")
 
 # =================== Utilidades base ===================
@@ -64,21 +62,44 @@ def run_async(coro):
 
 # ============== Toggle Dev: ocultar/mostrar toolbar & co. ============
 def apply_chrome_visibility(dev_mode: bool):
+    """
+    Cuando dev_mode=False (prod), oculta:
+      - Toolbar, MainMenu, header y footer
+      - Controles flotantes de Streamlit Cloud (incl. 'Manage app' y su chevron)
+    Cuando dev_mode=True (dev), no oculta nada.
+    """
     if dev_mode:
-        return  # mostrar toolbar/iconos
-    # Ocultar toolbar, menú, footer, botones header (Share, GitHub, etc.)
+        return  # mostrar todo en modo desarrollador
+
     st.markdown(
         """
         <style>
-        /* Oculta la barra superior y menús */
+        /* ====== Ocultar barra superior / menús / footer ====== */
         div[data-testid="stToolbar"] { display: none !important; }
-        #MainMenu { visibility: hidden; }
-        header { visibility: hidden; }
-        footer { visibility: hidden; }
-        /* Botones de header (p. ej. "Share") */
+        #MainMenu { visibility: hidden !important; }
+        header { visibility: hidden !important; }
+        footer { visibility: hidden !important; }
         button[kind="header"] { display: none !important; }
-        /* Enlaces con GitHub en top-right (por si existieran) */
-        a[href*="github.com"] { display: none !important; }
+
+        /* ====== Ocultar 'Manage app' (varias variantes) ====== */
+        div[data-testid="stStatusWidget"] { display: none !important; }
+        div[data-testid="StyledDeploymentStatus"] { display: none !important; }
+        a[data-testid="manage-app-button"],
+        button[data-testid="manage-app-button"] { display: none !important; }
+        a[title="Manage app"],
+        button[title="Manage app"],
+        [aria-label="Manage app"] { display: none !important; }
+        a[href*="manage"], a[href*="streamlit.io/"] { display: none !important; }
+
+        /* Chevron/back del flotante (cuando aparece) */
+        div[aria-label="Main menu"] { display: none !important; }
+        [data-testid="stActionButtonIcon"] { display: none !important; }
+
+        /* Fallback defensivo: contenedor que envuelve el botón */
+        div:has(> a[title="Manage app"]),
+        div:has(> button[title="Manage app"]) {
+          display: none !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -396,12 +417,14 @@ def on_dir_change_autovalidate():
         return
 
     try:
+        # 1) forward search (gratis) con límites/headers adecuados
         sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)  # 1.05s de pausa interna
         st.session_state["dir_sugerencias"] = sug or []
         if not sug:
             st.session_state["dir_status"] = "❌ No se encontró la dirección"
             return
 
+        # 2) toma la mejor coincidencia (primera) y normaliza por reverse
         best = sug[0]
         lat, lon = best.get("lat"), best.get("lon")
         if not (lat and lon):
@@ -479,7 +502,6 @@ async def hogar_mundo() -> List[Dict]:
         "https://www.tumundo.cl/planes-hogar/fibra-1g-mundo-go/",
         "https://www.tumundo.cl/planes-hogar/fibra-10g/",
     ]
-    # usaremos patrones de fibra/velocidad, no “internet” genérico
     found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for plan, price_str, price_int, speed_hint in found:
