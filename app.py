@@ -21,24 +21,31 @@ def ensure_chromium_installed():
     """
     Descarga Chromium SOLO una vez por sesión del servidor.
     - No usa '--with-deps' (evita sudo en Streamlit Cloud).
-    - Fuerza una ruta de cache dentro del home del usuario.
+    - Ubica los binarios en el HOME del usuario para evitar permisos.
+    - Quita '--retry' (no soportado en tu entorno).
     """
     os.environ.setdefault(
         "PLAYWRIGHT_BROWSERS_PATH",
         os.path.expanduser("~/.cache/ms-playwright")
     )
+
     try:
-        res = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium", "--retry", "3"],
+        # Instalación de navegadores (sin dependencias del SO)
+        # Importante: SIN '--with-deps' y SIN '--retry'
+        completed = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
         )
-        # st.text(res.stdout)  # descomenta si quieres ver el log de instalación
+        # Puedes inspeccionar el log si lo necesitas:
+        # st.code(completed.stdout, language="bash")
     except subprocess.CalledProcessError as e:
         st.error("No fue posible descargar Chromium automáticamente.")
+        # Muestra el log completo que emite playwright (para entender el motivo real)
         st.code(e.stdout or "", language="bash")
+        # Re-lanza para que el bloque llamador entre al except y lo reporte
         raise
 
 
@@ -170,7 +177,11 @@ if st.button("Buscar Ofertas Reales 🚀", use_container_width=True):
         st.error("Por favor completa tu RUT y Dirección en la barra lateral.")
     else:
         # 1) Descargar binarios de Chromium (cacheado, sin sudo)
-        ensure_chromium_installed()
+        try:
+            ensure_chromium_installed()
+        except Exception:
+            # El error y el log ya se muestran en ensure_chromium_installed()
+            st.stop()
 
         # 2) Consultar Mundo
         with st.spinner("Consultando Mundo Pacífico..."):
