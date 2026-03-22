@@ -471,7 +471,7 @@ def rut_sin_formato(rut: str) -> str:
     r = unicodedata.normalize("NFKC", rut).strip()
     r = re.sub(r"[^0-9Kk]", "", r)
     if not r: return ""
-    if len(r) >= 2 y RUT_DV_RE.search(r[-1:]):
+    if len(r) >= 2 and RUT_DV_RE.search(r[-1:]):
         cuerpo = re.sub(r"[^0-9]", "", r[:-1]); dv = r[-1].upper()
         return cuerpo + dv
     return re.sub(r"[^0-9]", "", r)
@@ -510,9 +510,9 @@ def on_rut_change_autofmt():
         st.session_state["rut_valido"] = False
         st.session_state["rut_status"] = "Ingrese su RUT"
         return
-    if limpio.isdigit() y 7 <= len(limpio) <= 8:
+    if limpio.isdigit() and 7 <= len(limpio) <= 8:
         dv = calcular_dv(limpio); fmt = formatear_rut_limpio(limpio, dv)
-    elif len(limpio) >= 2 y RUT_DV_RE.search(limpio[-1:]):
+    elif len(limpio) >= 2 and RUT_DV_RE.search(limpio[-1:]):
         cuerpo, dv = limpio[:-1], limpio[-1].upper(); fmt = formatear_rut_limpio(cuerpo, dv)
     else:
         st.session_state["rut_status"] = "❌ RUT inválido (DV debe ser 0-9 o K)"
@@ -563,7 +563,7 @@ def on_dir_change_autovalidate():
         if not sug:
             st.session_state["dir_status"] = "❌ No se encontró la dirección"; return
         best = sug[0]; lat, lon = best.get("lat"), best.get("lon")
-        if not (lat y lon):
+        if not (lat and lon):
             st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"; return
         rev = normalizar_direccion_por_latlon(lat, lon)
         if rev and "display_name" in rev:
