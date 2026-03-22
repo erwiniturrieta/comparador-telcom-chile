@@ -1,14 +1,12 @@
 # app.py
 # Comparador Telecom Chile - Hogar/Móvil
-# - RUT: autoformato + validación (módulo-11), sin "punto fantasma" y respeta ceros iniciales
-# - Dirección: forward search → reverse (Nominatim) con pausa ≤1 req/s
-# - Scraping Hogar: listas blancas por proveedor + filtro negativo anti-Empresas/Convenios
-# - Extracción robusta:
-#     * Velocidad (Mbps/Gbps) desde nombre o CONTEXTO (±1200)
-#     * Precio oferta (mensual), Periodo de oferta, Precio normal/luego
-#     * Instalación (monto) y "sin costo" cuando aplique
+# - Modo USER/DEV (por URL ?mode=, secrets MODE, env APP_MODE o toggle UI)
+# - USER: oculta toolbar/Manage app/etc.; DEV: muestra todo + panel diagnóstico
+# - RUT: autoformato + validación (módulo-11)
+# - Dirección: forward-search → reverse (Nominatim) con ≤1 req/s
+# - Scraping Hogar: listas blancas + filtro anti-Empresas/Convenios
+# - Extracción (contextual): Velocidad, Precio oferta, Periodo, Precio normal, Instalación
 # - DEDUP + Insignia: “🏷️ Oferta más barata” por (compañía, velocidad, pack)
-# - Toggle "Modo desarrollador": oculta/mostrar toolbar, "Manage app", etc.
 
 import os
 import re
@@ -25,24 +23,91 @@ import streamlit as st
 from playwright.async_api import async_playwright
 import requests
 
-# =================== Configuración de página ===================
-import streamlit as st
- 
-# 1. Configuración inicial
+# =================== MODO USER / DEV ===================
+def get_app_mode() -> str:
+    """Prioridad: URL ?mode=, luego st.secrets['MODE'], luego APP_MODE env, por defecto 'user'."""
+    try:
+        params = st.experimental_get_query_params()
+    except Exception:
+        params = {}
+    url_mode = (params.get("mode", [""])[0] or "").strip().lower()
+    if url_mode in {"dev", "user"}:
+        return url_mode
+
+    try:
+        sec_mode = (st.secrets.get("MODE") or "").strip().lower()
+        if sec_mode in {"dev", "user"}:
+            return sec_mode
+    except Exception:
+        pass
+
+    env_mode = (os.environ.get("APP_MODE") or "").strip().lower()
+    if env_mode in {"dev", "user"}:
+        return env_mode
+
+    return "user"  # default
+
+def inject_css_for_mode(mode: str):
+    """Oculta/mostrar elementos del chrome según el modo."""
+    if mode == "dev":
+        # No ocultar nada en vista desarrollador
+        return
+
+    # Vista USER: oculta toolbar, menús y 'Manage app' (selectors amplios)
+    css = """
+    <style>
+      #MainMenu {visibility: hidden !important;}
+      header {visibility: hidden !important;}
+      footer {visibility: hidden !important;}
+      .stAppDeployButton {display:none !important;}
+      #stDecoration {display:none !important;}
+      div[data-testid="stToolbar"] {display:none !important;}
+
+      /* Variantes cloud */
+      div[data-testid="stStatusWidget"] { display:none !important; }
+      div[data-testid="StyledDeploymentStatus"] { display:none !important; }
+      div[data-testid="stCloudDeployButton"] { display:none !important; }
+      div[data-testid="stCloudStatusWidget"] { display:none !important; }
+      div[data-testid="stActionButton"] { display:none !important; }
+
+      /* Botón/anchor Manage app y contenedores */
+      a[title="Manage app"], button[title="Manage app"], [aria-label="Manage app"] { display:none !important; }
+      a[href*="manage"], a[href*="streamlit.io"] { display:none !important; }
+      div:has(> a[title="Manage app"]), div:has(> button[title="Manage app"]) { display:none !important; }
+      svg[aria-label="ArrowLeft"], svg[data-testid="stIcon"] { display:none !important; }
+      /* Contenedores fijos en esquina inferior derecha (fallback) */
+      div[style*="position: fixed"][style*="right"][style*="bottom"] { display:none !important; }
+    </style>
+    """
+    st.markdown(css, unsafe_allow_html=True)
+
+# =================== Configuración de página + barra superior ===================
 st.set_page_config(page_title="Comparador Chile", page_icon="📡")
- 
-# 2. CÓDIGO PARA OCULTAR MENÚS (GitHub, Share, Deploy, etc.)
-hide_st_style = """
-            <style>
-            #MainMenu {visibility: hidden;}
-            header {visibility: hidden;}
-            footer {visibility: hidden;}
-            .stAppDeployButton {display:none;}
-            #stDecoration {display:none;}
-            </style>
-            """
-st.markdown(hide_st_style, unsafe_allow_html=True)
-st.title("📡 Mi Comparador Teleco")
+
+APP_MODE = get_app_mode()       # "dev" o "user"
+if "APP_MODE" not in st.session_state:
+    st.session_state["APP_MODE"] = APP_MODE
+else:
+    APP_MODE = st.session_state["APP_MODE"]
+
+inject_css_for_mode(APP_MODE)
+
+colA, colB = st.columns([1, 3])
+with colA:
+    toggle = st.toggle("Modo desarrollador", value=(APP_MODE == "dev"),
+                       help="Activa controles/diagnóstico y muestra el chrome de Streamlit")
+    if toggle and st.session_state["APP_MODE"] != "dev":
+        st.session_state["APP_MODE"] = "dev"
+        st.rerun()
+    elif (not toggle) and st.session_state["APP_MODE"] != "user":
+        st.session_state["APP_MODE"] = "user"
+        st.rerun()
+
+with colB:
+    st.title("📡 Mi Comparador Teleco")
+
+def is_dev() -> bool:
+    return st.session_state.get("APP_MODE", "user") == "dev"
 
 # =================== Utilidades base ===================
 @st.cache_resource(show_spinner=False)
@@ -74,51 +139,6 @@ def run_async(coro):
     except RuntimeError:
         return asyncio.run(coro)
 
-# ============== Toggle Dev: ocultar/mostrar toolbar & co. ============
-def apply_chrome_visibility(dev_mode: bool):
-    """
-    Cuando dev_mode=False (prod), oculta:
-      - Toolbar, MainMenu, header y footer
-      - Controles flotantes de Streamlit Cloud (incl. 'Manage app' y su chevron)
-    Cuando dev_mode=True (dev), no oculta nada.
-    """
-    if dev_mode:
-        return
-
-    st.markdown(
-        """
-        <style>
-        /* ====== Ocultar barra superior / menús / footer ====== */
-        div[data-testid="stToolbar"] { display: none !important; }
-        #MainMenu { visibility: hidden !important; }
-        header { visibility: hidden !important; }
-        footer { visibility: hidden !important; }
-        button[kind="header"] { display: none !important; }
-
-        /* ====== Ocultar 'Manage app' (varias variantes) ====== */
-        div[data-testid="stStatusWidget"] { display: none !important; }
-        div[data-testid="StyledDeploymentStatus"] { display: none !important; }
-        a[data-testid="manage-app-button"],
-        button[data-testid="manage-app-button"] { display: none !important; }
-        a[title="Manage app"],
-        button[title="Manage app"],
-        [aria-label="Manage app"] { display: none !important; }
-        a[href*="manage"], a[href*="streamlit.io/"] { display: none !important; }
-
-        /* Chevron/back del flotante (cuando aparece) */
-        div[aria-label="Main menu"] { display: none !important; }
-        [data-testid="stActionButtonIcon"] { display: none !important; }
-
-        /* Fallback defensivo */
-        div:has(> a[title="Manage app"]),
-        div:has(> button[title="Manage app"]) {
-          display: none !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
 # =================== Parsers / Regex comunes ===================
 PRICE_RE = re.compile(r"\$\s?\d{1,3}(?:\.\d{3})+", re.IGNORECASE)
 NEGATIVE_RE = re.compile(r"empresa|empresas|corporativ|pyme|emprendedor|convenio", re.IGNORECASE)
@@ -130,12 +150,15 @@ MBPS_RE = re.compile(r"\b(\d{2,5})\s*(?:m(?:b(?:ps)?|b\/s)?|mega?s?)\b", re.IGNO
 HASTA_RE = re.compile(r"\bhasta\b\s+(\d+(?:[.,]\d+)?)\s*(?:mbps|mb\/s|mb|mega?s?|g(?:ig?a)?|gb(?:ps)?)", re.IGNORECASE)
 
 # ---- Contexto de precios ----
-MIN_MONTHLY_CLP = 7000  # umbral anti-ruido (descarta extensor $2.990, add-ons $1.990, etc.)
+MIN_MONTHLY_CLP = 7000  # umbral anti-ruido
 MONTHLY_NEAR_RE = re.compile(
     r"(al\s*mes|/mes|\bmes\b|mensual|por\s*\d+\s*mes(?:es)?|por\s*1\s*a[nñ]o|x\s*\d+\s*mes(?:es)?)",
     re.IGNORECASE
 )
-LUEGO_RE = re.compile(r"(luego|despu[eé]s|desde\s+el\s+mes\s*\d+|precio\s*normal)", re.IGNORECASE)
+LUEGO_RE = re.compile(
+    r"(luego|despu[eé]s|desde\s+(?:el\s+)?mes\s*\d+|precio\s*normal)",
+    re.IGNORECASE
+)
 INSTALL_OR_EXTRA_RE = re.compile(
     r"(instalaci[oó]n|despacho|costo|arriendo|arr[ií]endo|router|extensor|repetidor|smart\s*wifi|"
     r"mcafee|m[uú]sica|cloud|prime\s*video|disney|streaming)",
@@ -143,7 +166,7 @@ INSTALL_OR_EXTRA_RE = re.compile(
 )
 FREE_RE = re.compile(r"(sin\s*costo|gratis)", re.IGNORECASE)
 PERIODO_RE = re.compile(
-    r"(?:por|x)\s*(\d+)\s*mes(?:es)?|por\s*1\s*a[nñ]o|por\s*un\s*a[nñ]o",
+    r"(?:por|x)\s*(\d+)\s*mes(?:es)?|por\s*(?:un|1)\s*a[nñ]o",
     re.IGNORECASE
 )
 
@@ -276,17 +299,9 @@ def infer_mobile_detail(plan: str) -> str:
 
 # ---------- Clasificación de precios por contexto ----------
 def _label_price_in_context(ctx: str, start: int, end: int, window: int = 100) -> str:
-    """
-    Etiqueta un precio según las palabras cercanas (±window):
-      - 'monthly'   si hay "al mes", "/mes", "mensual", "por N meses/por 1 año/x N meses"
-      - 'later'     si hay "luego", "precio normal", etc.
-      - 'install'   si hay "instalación", "extensor", "repetidor", etc.
-      - 'unknown'   en otro caso
-    """
     s = max(0, start - window)
     e = min(len(ctx), end + window)
     around = ctx[s:e].lower()
-
     if INSTALL_OR_EXTRA_RE.search(around):
         return "install"
     if MONTHLY_NEAR_RE.search(around):
@@ -297,52 +312,38 @@ def _label_price_in_context(ctx: str, start: int, end: int, window: int = 100) -
 
 def _extract_offer_period(around_text: str) -> str:
     """
-    Devuelve string normalizado del periodo en el contexto cercano, ej. '6 meses', '1 año'.
+    Normaliza el periodo a 'N meses':
+      - 'por 12 meses' -> '12 meses'
+      - 'por 1/un año' -> '12 meses'
     """
-    m = PERIODO_RE.search(around_text)
+    t = around_text.lower()
+    m = PERIODO_RE.search(t)
     if not m:
         return ""
-    g = m.group(0).lower()
-    g = g.replace("un", "1").replace("año", "año").strip()
-    # normaliza espacios
-    return re.sub(r"\s+", " ", g)
+    if m.group(1):
+        return f"{int(m.group(1))} meses"
+    return "12 meses"
 
 def _choose_prices_from_context(ctx: str) -> Optional[Dict[str, Optional[str]]]:
-    """
-    Recorre TODOS los precios del contexto y devuelve un diccionario con:
-      - price_offer_str / price_offer_int
-      - offer_period_str
-      - price_normal_str / price_normal_int
-      - install_cost_int / install_free (bool)
-    Lógica:
-      * Preferencia por 'monthly' con pi >= MIN_MONTHLY_CLP (elige el menor).
-      * 'later' intenta ser el precio normal (elige el menor >= umbral fuera de oferta).
-      * 'install' suma info de instalación (si 'sin costo', marca install_free=True; si tiene $X, captura).
-    """
     if not ctx:
         return None
-
     labels = []
     for m in PRICE_RE.finditer(ctx):
-        ps = m.group(0)
-        pi = clp_to_int(ps)
+        ps, pi = m.group(0), clp_to_int(m.group(0))
         lb = _label_price_in_context(ctx, m.start(), m.end())
         labels.append((lb, ps, pi, m.start(), m.end()))
 
-    # Oferta mensual (válida)
+    # Oferta mensual válida
     monthly = [(ps, pi, s, e) for (lb, ps, pi, s, e) in labels if lb == "monthly" and pi >= MIN_MONTHLY_CLP]
     price_offer_str = None
     price_offer_int = None
     offer_period_str = ""
-
     if monthly:
         price_offer_str, price_offer_int, s_off, e_off = sorted(monthly, key=lambda x: x[1])[0]
-        # Busca periodo cerca del precio oferta
-        s = max(0, s_off - 120)
-        e = min(len(ctx), e_off + 120)
+        s = max(0, s_off - 120); e = min(len(ctx), e_off + 120)
         offer_period_str = _extract_offer_period(ctx[s:e]) or ""
 
-    # Precio normal/luego (válido)
+    # Precio normal/luego
     later = [(ps, pi) for (lb, ps, pi, s, e) in labels if lb == "later" and pi >= MIN_MONTHLY_CLP]
     price_normal_str = None
     price_normal_int = None
@@ -352,7 +353,6 @@ def _choose_prices_from_context(ctx: str) -> Optional[Dict[str, Optional[str]]]:
     # Instalación
     install_cost_int = None
     install_free = False
-    # Si hay "instalación sin costo" sin precio explícito, marcamos free
     if re.search(r"instalaci[oó]n[^$]{0,40}(sin\s*costo|gratis)", ctx, flags=re.IGNORECASE):
         install_free = True
         install_cost_int = 0
@@ -363,7 +363,6 @@ def _choose_prices_from_context(ctx: str) -> Optional[Dict[str, Optional[str]]]:
             install_cost_int = pi
             install_free = (pi == 0)
 
-    # Si no quedó nada válido, abortar
     if not price_offer_int and not price_normal_int:
         return None
 
@@ -379,24 +378,14 @@ def _choose_prices_from_context(ctx: str) -> Optional[Dict[str, Optional[str]]]:
 
 # =================== EXTRACTOR con speed_hint (ventana ±1200) ===================
 def extract_plans_via_regex(html: str, max_items: int = 24, ctx_window: int = 1200) -> List[Dict]:
-    """
-    Busca precios y datos en contexto (±ctx_window) y devuelve dicts con:
-      - plan_name, speed_hint
-      - price_offer_str / _int, offer_period_str
-      - price_normal_str / _int
-      - install_cost_int, install_free
-    Descarta contextos de Empresas/Convenios.
-    """
     results: List[Dict] = []
     for m in PRICE_RE.finditer(html):
         start = max(m.start() - ctx_window, 0)
         end = min(m.end() + ctx_window, len(html))
         ctx = html[start:end]
-
         if NEGATIVE_RE.search(ctx):
             continue
 
-        # Nombre de plan
         plan_match = (
             re.search(r"(PLAN\s*[0-9A-Z]+\s*[^\$<>{}|]{0,180})", ctx, re.IGNORECASE)
             or re.search(r"((?:Internet\s*)?Fibra\s*(?:Gamer|Giga|[0-9]{2,4})\s*(?:Megas?|Mb|Mbps|Gigas?)?)", ctx, re.IGNORECASE)
@@ -409,25 +398,26 @@ def extract_plans_via_regex(html: str, max_items: int = 24, ctx_window: int = 12
             plan_name = re.sub(r"\s+", " ", plan_match.group(1)).strip()
             plan_name = re.sub(r"(POR\s+\d+\s+MESES|SOLO\s+FIBRA|HASTA|OFERTA\s+WEB).*$", "", plan_name, flags=re.IGNORECASE).strip(" -–:|.")
 
-        # Velocidad
         speed_hint = extract_speed_from_text(ctx)
-
-        # Precios
         price_payload = _choose_prices_from_context(ctx)
         if not price_payload:
             continue
 
-        results.append({
+        row = {
             "plan_name": plan_name,
             "speed_hint": speed_hint,
             **price_payload
-        })
+        }
+        # En modo dev, opcionalmente guarda un breve contexto
+        if is_dev():
+            keep = ctx[max(0, len(ctx)//2 - 300): min(len(ctx), len(ctx)//2 + 300)]
+            row["__context_snippet"] = keep
+        results.append(row)
+
         if len(results) >= max_items:
             break
 
-    # Dedup por (plan_name, price_offer_int/normal_int, speed_hint)
-    seen = set()
-    dedup: List[Dict] = []
+    seen = set(); dedup: List[Dict] = []
     for p in results:
         key = (
             (p.get("plan_name") or "").lower(),
@@ -453,32 +443,25 @@ def calcular_dv(rut_cuerpo: str) -> str:
         suma += int(d) * factores[i % 6]
     resto = suma % 11
     dv = 11 - resto
-    if dv == 11:
-        return "0"
-    if dv == 10:
-        return "K"
+    if dv == 11: return "0"
+    if dv == 10: return "K"
     return str(dv)
 
 def rut_sin_formato(rut: str) -> str:
-    if not rut:
-        return ""
+    if not rut: return ""
     r = unicodedata.normalize("NFKC", rut).strip()
     r = re.sub(r"[^0-9Kk]", "", r)
-    if not r:
-        return ""
+    if not r: return ""
     if len(r) >= 2 and RUT_DV_RE.search(r[-1:]):
-        cuerpo = re.sub(r"[^0-9]", "", r[:-1])
-        dv = r[-1].upper()
+        cuerpo = re.sub(r"[^0-9]", "", r[:-1]); dv = r[-1].upper()
         return cuerpo + dv
     return re.sub(r"[^0-9]", "", r)
 
 def formatear_rut_limpio(cuerpo: str, dv: str) -> str:
-    if not cuerpo or not dv:
-        return ""
+    if not cuerpo or not dv: return ""
     chunks = []
     while cuerpo:
-        chunks.append(cuerpo[-3:])
-        cuerpo = cuerpo[:-3]
+        chunks.append(cuerpo[-3:]); cuerpo = cuerpo[:-3]
     cuerpo_fmt = ".".join(reversed(chunks))
     return f"{cuerpo_fmt}-{dv}"
 
@@ -486,45 +469,35 @@ def formatear_rut(rut: str) -> str:
     limpio = rut_sin_formato(rut)
     if len(limpio) < 2:
         cuerpo = limpio
-        if not cuerpo:
-            return ""
+        if not cuerpo: return ""
         chunks, aux = [], cuerpo
         while aux:
-            chunks.append(aux[-3:])
-            aux = aux[:-3]
+            chunks.append(aux[-3:]); aux = aux[:-3]
         return ".".join(reversed(chunks))
     cuerpo, dv = limpio[:-1], limpio[-1]
     return formatear_rut_limpio(cuerpo, dv)
 
 def validar_rut(rut: str) -> bool:
     limpio = rut_sin_formato(rut)
-    if len(limpio) < 2:
-        return False
+    if len(limpio) < 2: return False
     cuerpo, dv = limpio[:-1], limpio[-1]
-    dv_calc = calcular_dv(cuerpo)
-    return dv_calc == dv
+    return calcular_dv(cuerpo) == dv
 
 def on_rut_change_autofmt():
     raw = st.session_state.get("rut_raw", "") or ""
     limpio = rut_sin_formato(raw)
-
     if not limpio:
         st.session_state["rut_formateado"] = ""
         st.session_state["rut_valido"] = False
         st.session_state["rut_status"] = "Ingrese su RUT"
         return
-
     if limpio.isdigit() and 7 <= len(limpio) <= 8:
-        dv = calcular_dv(limpio)
-        fmt = formatear_rut_limpio(limpio, dv)
+        dv = calcular_dv(limpio); fmt = formatear_rut_limpio(limpio, dv)
     elif len(limpio) >= 2 and RUT_DV_RE.search(limpio[-1:]):
-        cuerpo, dv = limpio[:-1], limpio[-1].upper()
-        fmt = formatear_rut_limpio(cuerpo, dv)
+        cuerpo, dv = limpio[:-1], limpio[-1].upper(); fmt = formatear_rut_limpio(cuerpo, dv)
     else:
         st.session_state["rut_status"] = "❌ RUT inválido (DV debe ser 0-9 o K)"
-        st.session_state["rut_valido"] = False
-        return
-
+        st.session_state["rut_valido"] = False; return
     st.session_state["rut_raw"] = fmt
     es_ok = validar_rut(fmt)
     st.session_state["rut_formateado"] = fmt
@@ -539,23 +512,19 @@ def _nominatim_headers():
     return {"User-Agent": "MiComparadorTelecom/1.0 (Streamlit; contacto: soporte@ejemplo.cl)"}
 
 def buscar_direccion_gratis(q: str, countrycodes: str = "cl", limit: int = 3) -> List[Dict]:
-    if not q:
-        return []
+    if not q: return []
     params = {"q": q, "format": "jsonv2", "addressdetails": 1, "limit": limit, "countrycodes": countrycodes}
     time.sleep(1.05)
     r = requests.get(NOMINATIM_SEARCH, params=params, headers=_nominatim_headers(), timeout=20)
-    if r.status_code != 200:
-        return []
+    if r.status_code != 200: return []
     return r.json()
 
 def normalizar_direccion_por_latlon(lat: str, lon: str) -> Optional[Dict]:
-    if not lat or not lon:
-        return None
+    if not lat or not lon: return None
     params = {"lat": lat, "lon": lon, "format": "jsonv2", "addressdetails": 1, "zoom": 18, "accept-language": "es-CL"}
     time.sleep(1.05)
     r = requests.get(NOMINATIM_REVERSE, params=params, headers=_nominatim_headers(), timeout=20)
-    if r.status_code != 200:
-        return None
+    if r.status_code != 200: return None
     return r.json()
 
 def on_dir_change_autovalidate():
@@ -569,20 +538,14 @@ def on_dir_change_autovalidate():
         st.session_state["dir_sugerencias"] = []
         st.session_state["dir_status"] = "Escriba una dirección más específica"
         return
-
     try:
         sug = buscar_direccion_gratis(q, countrycodes="cl", limit=3)
         st.session_state["dir_sugerencias"] = sug or []
         if not sug:
-            st.session_state["dir_status"] = "❌ No se encontró la dirección"
-            return
-
-        best = sug[0]
-        lat, lon = best.get("lat"), best.get("lon")
+            st.session_state["dir_status"] = "❌ No se encontró la dirección"; return
+        best = sug[0]; lat, lon = best.get("lat"), best.get("lon")
         if not (lat and lon):
-            st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"
-            return
-
+            st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"; return
         rev = normalizar_direccion_por_latlon(lat, lon)
         if rev and "display_name" in rev:
             st.session_state["dir_input"] = rev["display_name"]
@@ -593,11 +556,15 @@ def on_dir_change_autovalidate():
         st.session_state["dir_status"] = "⚠️ Error validando con Nominatim"
 
 # =================== Scraping helper (Playwright) ===================
+@st.cache_data(ttl=1800, show_spinner=False)  # cache 30 min para acelerar visitas repetidas
+def _cached_scrape(proveedor: str, urls: List[str], filters_regex: str) -> List[Dict]:
+    return run_async(_scrape_urls(urls, filters_regex))
+
 async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Dict]:
     """
     - Deja pasar tarjetas cuyo NOMBRE case con `filters_regex` (fibra/mbps/mega/giga) o que tengan speed_hint.
     - Descarta contextos de Empresa/Corporativo/Convenios.
-    - Devuelve dicts con plan/prices/instalación/periodo/velocidad.
+    - Devuelve dicts con plan/prices/instalación/periodo/velocidad (+snippet en dev).
     """
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
@@ -626,10 +593,8 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Dict]:
                     for d in found:
                         plan_name = d.get("plan_name", "")
                         speed_hint = d.get("speed_hint", "")
-                        # Filtro positivo por nombre (o speed_hint)
                         if not (speed_hint or (plan_name and re.search(filters_regex, plan_name, re.IGNORECASE))):
                             continue
-                        # Filtro negativo por nombre
                         if plan_name and NEGATIVE_RE.search(plan_name):
                             continue
                         results.append(d)
@@ -653,9 +618,6 @@ async def _scrape_urls(urls: List[str], filters_regex: str) -> List[Dict]:
 
 # =================== Scrapers HOGAR (URLs residenciales) ===================
 def _row_from_dict(d: Dict, prov_flag: Dict[str, str], pack_tipo: str, velocidad: str) -> Dict:
-    """
-    Construye una fila estándar para DataFrame con nuevas columnas de oferta/normal/instalación.
-    """
     price_offer_str = d.get("price_offer_str") or ""
     price_offer_int = d.get("price_offer_int") if d.get("price_offer_int") is not None else -1
     price_normal_str = d.get("price_normal_str") or ""
@@ -664,11 +626,10 @@ def _row_from_dict(d: Dict, prov_flag: Dict[str, str], pack_tipo: str, velocidad
     install_cost_int = d.get("install_cost_int")
     install_free = d.get("install_free", False)
 
-    # "costo total" = precio oferta (cuando exista) o precio normal
     precio_mostrar = price_offer_int if price_offer_int and price_offer_int > 0 else price_normal_int
     precio_mostrar_str = format_clp(precio_mostrar) if precio_mostrar >= 0 else (price_offer_str or price_normal_str or "")
 
-    return {
+    row = {
         **prov_flag,
         "pack seleccionado": pack_tipo,
         "velocidad": velocidad,
@@ -678,11 +639,13 @@ def _row_from_dict(d: Dict, prov_flag: Dict[str, str], pack_tipo: str, velocidad
         "instalación": (format_clp(install_cost_int) if (install_cost_int is not None and install_cost_int > 0) else ("$0" if install_free else "")),
         "instalación sin costo": "Sí" if (install_free or install_cost_int == 0) else "No" if (install_cost_int and install_cost_int > 0) else "",
         "costo total": precio_mostrar_str,
-        # Auxiliares:
         "Precio_CLP": precio_mostrar,
         "__prov": [k for k,v in prov_flag.items() if v=="✔"][0] if any(v=="✔" for v in prov_flag.values()) else "",
         "__plan": d.get("plan_name") or ""
     }
+    if is_dev() and "__context_snippet" in d:
+        row["__context_snippet"] = d["__context_snippet"]
+    return row
 
 async def hogar_mundo() -> List[Dict]:
     urls = [
@@ -692,7 +655,7 @@ async def hogar_mundo() -> List[Dict]:
         "https://www.tumundo.cl/planes-hogar/fibra-1g-mundo-go/",
         "https://www.tumundo.cl/planes-hogar/fibra-10g/",
     ]
-    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
+    found = _cached_scrape("mundo", urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -713,7 +676,7 @@ async def hogar_movistar() -> List[Dict]:
         "https://ww2.movistar.cl/hogar/arma-tu-plan/",
         "https://ww2.movistar.cl/hogar/pack-duos-internet-television/",
     ]
-    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
+    found = _cached_scrape("movistar", urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -732,7 +695,7 @@ async def hogar_entel() -> List[Dict]:
         "https://www.entel.cl/hogar/internet",
         "https://www.entel.cl/hogar/fibra-optica",
     ]
-    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
+    found = _cached_scrape("entel", urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -752,7 +715,7 @@ async def hogar_wom() -> List[Dict]:
         "https://store.wom.cl/hogar/internet-tv-hogar",
         "https://store.wom.cl/fibra/",
     ]
-    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
+    found = _cached_scrape("wom", urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -773,7 +736,7 @@ async def hogar_vtr() -> List[Dict]:
         "https://www.nuevo.vtr.com/comparador-planes",
         "https://vtr.com/productos/hogar-packs/internet-hogar/",
     ]
-    found = await _scrape_urls(urls, r"fibra|giga|megas?|mbps|mb\/s")
+    found = _cached_scrape("vtr", urls, r"fibra|giga|megas?|mbps|mb\/s")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -794,7 +757,7 @@ async def movistar_movil() -> List[Dict]:
         "https://ww2.movistar.cl/ofertas/ofertador-movil/",
         "https://ww2.movistar.cl/movil/deglose-planes-moviles/",
     ]
-    found = await _scrape_urls(urls, r"5g|plan|gb|gigas|móvil|movil")
+    found = _cached_scrape("movistar_movil", urls, r"5g|plan|gb|gigas|móvil|movil")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -802,11 +765,8 @@ async def movistar_movil() -> List[Dict]:
             "mundo": "", "movistar": "✔", "entel": "", "wom": "", "vtr": "",
             "pack seleccionado": "solo internet móvil",
             "velocidad": "",
-            "precio oferta": "",
-            "periodo oferta": "",
-            "precio normal": "",
-            "instalación": "",
-            "instalación sin costo": "",
+            "precio oferta": "", "periodo oferta": "", "precio normal": "",
+            "instalación": "", "instalación sin costo": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
             "costo total": format_clp(d.get("price_offer_int") or d.get("price_normal_int") or -1) if (d.get("price_offer_int") or d.get("price_normal_int")) else "",
             "Precio_CLP": d.get("price_offer_int") or d.get("price_normal_int") or -1,
@@ -821,7 +781,7 @@ async def entel_movil() -> List[Dict]:
         "https://www.entel.cl/planes/internet-movil",
         "https://www.entel.cl/planes/detalle/plan-libre",
     ]
-    found = await _scrape_urls(urls, r"plan|5g|gigas|gb|internet móvil|movil")
+    found = _cached_scrape("entel_movil", urls, r"plan|5g|gigas|gb|internet móvil|movil")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -829,11 +789,8 @@ async def entel_movil() -> List[Dict]:
             "mundo": "", "movistar": "", "entel": "✔", "wom": "", "vtr": "",
             "pack seleccionado": "solo internet móvil",
             "velocidad": "",
-            "precio oferta": "",
-            "periodo oferta": "",
-            "precio normal": "",
-            "instalación": "",
-            "instalación sin costo": "",
+            "precio oferta": "", "periodo oferta": "", "precio normal": "",
+            "instalación": "", "instalación sin costo": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
             "costo total": format_clp(d.get("price_offer_int") or d.get("price_normal_int") or -1) if (d.get("price_offer_int") or d.get("price_normal_int")) else "",
             "Precio_CLP": d.get("price_offer_int") or d.get("price_normal_int") or -1,
@@ -847,7 +804,7 @@ async def wom_movil() -> List[Dict]:
         "https://store.wom.cl/planes/planes-portabilidad",
         "https://store.wom.cl/planes/planes-linea-nueva/grupales",
     ]
-    found = await _scrape_urls(urls, r"plan|gigas|gb|5g")
+    found = _cached_scrape("wom_movil", urls, r"plan|gigas|gb|5g")
     out: List[Dict] = []
     for d in found:
         plan = d.get("plan_name") or ""
@@ -855,11 +812,8 @@ async def wom_movil() -> List[Dict]:
             "mundo": "", "movistar": "", "entel": "", "wom": "✔", "vtr": "",
             "pack seleccionado": "solo internet móvil",
             "velocidad": "",
-            "precio oferta": "",
-            "periodo oferta": "",
-            "precio normal": "",
-            "instalación": "",
-            "instalación sin costo": "",
+            "precio oferta": "", "periodo oferta": "", "precio normal": "",
+            "instalación": "", "instalación sin costo": "",
             "detalle movil": infer_mobile_detail(plan) or "Gigas Libres/GB",
             "costo total": format_clp(d.get("price_offer_int") or d.get("price_normal_int") or -1) if (d.get("price_offer_int") or d.get("price_normal_int")) else "",
             "Precio_CLP": d.get("price_offer_int") or d.get("price_normal_int") or -1,
@@ -883,10 +837,6 @@ def _limpiar_filtros():
 with st.sidebar:
     st.header("Datos del cliente")
 
-    # Toggle Dev
-    st.checkbox("Modo desarrollador (mostrar toolbar)", value=False, key="dev_mode")
-    apply_chrome_visibility(st.session_state.get("dev_mode", False))
-
     st.text_input(
         "RUT (autoformato y validación)",
         key="rut_raw",
@@ -904,7 +854,7 @@ with st.sidebar:
     st.caption(st.session_state.get("dir_status", "Escribe una dirección y presiona Enter"))
 
     sug = st.session_state.get("dir_sugerencias", []) or []
-    if sug:
+    if is_dev() and sug:
         st.write("Coincidencias (top 3):")
         for i, s in enumerate(sug[:3], start=1):
             st.write(f"{i}. {s.get('display_name','')}")
@@ -1002,7 +952,12 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                     df = df[df["__tipo"].isin(seleccion)]
                     df = df.drop(columns=["__tipo"], errors="ignore")
 
-                # >>> INSIGNIA + DEDUP HOGAR (usa Precio_CLP basado en oferta)
+                # (Opcional) En modo dev, mostrar crudo sin dedup
+                if is_dev() and not df.empty:
+                    with st.expander("🔎 Diagnóstico (dev): datos crudos antes de dedup"):
+                        st.dataframe(df, use_container_width=True)
+
+                # >>> INSIGNIA + DEDUP HOGAR
                 if not df.empty:
                     df["insignia"] = ""
                     if "Precio_CLP" in df.columns:
@@ -1017,11 +972,17 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                 if df.empty:
                     st.info("No se encontraron planes que coincidan con los filtros (Hogar).")
                 else:
-                    # Asegurar columnas finales y vacíos como ""
+                    # Columnas extra SOLO en dev
+                    if is_dev():
+                        extras = ["__prov","__plan","Precio_CLP","__context_snippet"]
+                        extras = [c for c in extras if c in df.columns]
+                        if extras:
+                            with st.expander("🧰 (dev) Columnas auxiliares"):
+                                st.dataframe(df[extras].head(50), use_container_width=True)
+
                     for c in cols_final:
                         if c not in df.columns:
                             df[c] = ""
-                    # Orden por precio oferta/normal
                     if "Precio_CLP" in df.columns:
                         df = df.sort_values(by="Precio_CLP", na_position="last")
                     st.success("¡Ofertas Hogar encontradas!")
@@ -1054,6 +1015,11 @@ else:
                     dfm["__tipo"] = dfm["pack seleccionado"].str.lower().fillna("")
                     dfm = dfm[dfm["__tipo"].isin(seleccion)]
                     dfm = dfm.drop(columns=["__tipo"], errors="ignore")
+
+                # (Opcional) Vista cruda en dev
+                if is_dev() and not dfm.empty:
+                    with st.expander("🔎 Diagnóstico (dev): datos móviles crudos"):
+                        st.dataframe(dfm, use_container_width=True)
 
                 # Combos Fibra + Móvil si está seleccionado y tenemos fibra previa
                 if "fibra + móvil" in seleccion:
@@ -1103,6 +1069,13 @@ else:
                 if dfm.empty:
                     st.info("No se encontraron planes móviles (o selecciona 'Fibra + Móvil' tras ejecutar primero Hogar).")
                 else:
+                    if is_dev():
+                        extras = ["__prov","__plan","Precio_CLP","__context_snippet"]
+                        extras = [c for c in extras if c in dfm.columns]
+                        if extras:
+                            with st.expander("🧰 (dev) Columnas auxiliares móviles"):
+                                st.dataframe(dfm[extras].head(50), use_container_width=True)
+
                     for c in cols_final:
                         if c not in dfm.columns:
                             dfm[c] = ""
@@ -1110,7 +1083,6 @@ else:
                         dfm = dfm.sort_values(by="Precio_CLP", na_position="last")
                     st.success("¡Planes móviles listos!")
                     st.dataframe(dfm[cols_final], use_container_width=True)
-
             except Exception as e:
                 st.error(f"Falla en la consulta Móvil: {e}")
                 st.caption("Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez.")
