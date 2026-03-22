@@ -259,7 +259,7 @@ def infer_service_type(plan: str, force_mobile: bool = False) -> str:
         if "gigas" in t or "gb" in t:
             return "solo internet móvil"
         return "solo telefonía móvil"
-    if ("telef" in t or "fija" in t) and ("fibra" not in t y "internet" not in t and "tv" not in t):
+    if ("telef" in t or "fija" in t) and ("fibra" not in t and "internet" not in t and "tv" not in t):
         return "solo telefonía fija"
     if ("tv" in t or "zapping" in t or "mundo go" in t or "televisión" in t or "television" in t) and ("fibra" not in t and "internet" not in t):
         return "solo tv"
