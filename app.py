@@ -1155,4 +1155,4 @@ else:
                     st.dataframe(dfm[cols_final], use_container_width=True)
             except Exception as e:
                 st.error(f"Falla en la consulta Móvil: {e}")
-                st.caption("Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez."
+                st.caption("Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez.")
