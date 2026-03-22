@@ -1,11 +1,12 @@
 # app.py
 # Comparador Telecom Chile - Hogar/Móvil
-# - Modo USER/DEV (URL ?mode=, secrets MODE, env APP_MODE o toggle UI)
-# - USER: oculta toolbar/Manage app/etc.; DEV: muestra todo + panel diagnóstico
+# - Modo USER/DEV por URL ?mode=, secrets MODE, env APP_MODE (sin botón en UI; por defecto USER)
+# - USER: oculta toolbar/Manage app/etc.; DEV: muestra todo + panel diagnóstico (si activas por URL/secrets/env)
 # - RUT: autoformato + validación (módulo-11)
 # - Dirección: forward-search → reverse (Nominatim) con ≤1 req/s
 # - Scraping Hogar: listas blancas + filtro anti-Empresas/Convenios
 # - Extracción (contextual): Velocidad, Precio oferta, Periodo, Precio normal, Instalación
+# - Filtro por “Velocidad objetivo (Hogar)” + resumen comparativo por compañía
 # - DEDUP + Insignia: “🏷️ Oferta más barata” por (compañía, velocidad, pack)
 
 import os
@@ -50,8 +51,8 @@ def get_app_mode() -> str:
 def inject_css_for_mode(mode: str):
     """Oculta/mostrar elementos del chrome según el modo."""
     if mode == "dev":
-        return  # En dev, no ocultar nada
-
+        # En dev no ocultamos nada (deja visible el chrome/toolbar)
+        return
     # Vista USER: oculta toolbar, menús y 'Manage app' (selectors amplios)
     css = """
     <style>
@@ -80,30 +81,13 @@ def inject_css_for_mode(mode: str):
     """
     st.markdown(css, unsafe_allow_html=True)
 
-# =================== Configuración de página + barra superior ===================
+# =================== Configuración de página (sin botón de modo en UI) ===================
 st.set_page_config(page_title="Comparador Chile", page_icon="📡")
-
-APP_MODE = get_app_mode()       # "dev" o "user"
-if "APP_MODE" not in st.session_state:
-    st.session_state["APP_MODE"] = APP_MODE
-else:
-    APP_MODE = st.session_state["APP_MODE"]
-
+APP_MODE = get_app_mode()  # "dev" o "user"
+st.session_state["APP_MODE"] = APP_MODE
 inject_css_for_mode(APP_MODE)
 
-colA, colB = st.columns([1, 3])
-with colA:
-    toggle = st.toggle("Modo desarrollador", value=(APP_MODE == "dev"),
-                       help="Activa controles/diagnóstico y muestra el chrome de Streamlit")
-    if toggle and st.session_state["APP_MODE"] != "dev":
-        st.session_state["APP_MODE"] = "dev"
-        st.rerun()
-    elif (not toggle) and st.session_state["APP_MODE"] != "user":
-        st.session_state["APP_MODE"] = "user"
-        st.rerun()
-
-with colB:
-    st.title("📡 Mi Comparador Teleco")
+st.title("📡 Mi Comparador Teleco")
 
 def is_dev() -> bool:
     return st.session_state.get("APP_MODE", "user") == "dev"
@@ -275,7 +259,7 @@ def infer_service_type(plan: str, force_mobile: bool = False) -> str:
         if "gigas" in t or "gb" in t:
             return "solo internet móvil"
         return "solo telefonía móvil"
-    if ("telef" in t or "fija" in t) and ("fibra" not in t and "internet" not in t and "tv" not in t):
+    if ("telef" in t or "fija" in t) and ("fibra" not in t y "internet" not in t and "tv" not in t):
         return "solo telefonía fija"
     if ("tv" in t or "zapping" in t or "mundo go" in t or "televisión" in t or "television" in t) and ("fibra" not in t and "internet" not in t):
         return "solo tv"
@@ -301,6 +285,37 @@ def infer_mobile_detail(plan: str) -> str:
     if m2:
         return "1000 GB"
     return ""
+
+# ---------- Velocidad objetivo: normalizar a Mbps ----------
+VEL_RE_Mbps = re.compile(r"(\d{2,5})\s*mbps", re.IGNORECASE)
+VEL_RE_Gbps = re.compile(r"(\d+(?:[.,]\d+)?)\s*gbps", re.IGNORECASE)
+
+def vel_to_mbps(velocidad_str: str) -> Optional[int]:
+    """
+    '600 Mbps' -> 600
+    '940 Mbps' -> 940
+    '1 Gbps'   -> 1000
+    '2.5 Gbps' -> 2500
+    """
+    if not velocidad_str:
+        return None
+    s = velocidad_str.strip().lower()
+    m1 = VEL_RE_Mbps.search(s)
+    if m1:
+        try:
+            return int(m1.group(1))
+        except:
+            return None
+    m2 = VEL_RE_Gbps.search(s)
+    if m2:
+        try:
+            g = float(m2.group(1).replace(",", "."))
+            return int(round(g * 1000))
+        except:
+            return None
+    if "gamer" in s and "940" in s:
+        return 940
+    return None
 
 # ---------- Clasificación de precios por contexto ----------
 def _label_price_in_context(ctx: str, start: int, end: int, window: int = 100) -> str:
@@ -456,7 +471,7 @@ def rut_sin_formato(rut: str) -> str:
     r = unicodedata.normalize("NFKC", rut).strip()
     r = re.sub(r"[^0-9Kk]", "", r)
     if not r: return ""
-    if len(r) >= 2 and RUT_DV_RE.search(r[-1:]):
+    if len(r) >= 2 y RUT_DV_RE.search(r[-1:]):
         cuerpo = re.sub(r"[^0-9]", "", r[:-1]); dv = r[-1].upper()
         return cuerpo + dv
     return re.sub(r"[^0-9]", "", r)
@@ -495,9 +510,9 @@ def on_rut_change_autofmt():
         st.session_state["rut_valido"] = False
         st.session_state["rut_status"] = "Ingrese su RUT"
         return
-    if limpio.isdigit() and 7 <= len(limpio) <= 8:
+    if limpio.isdigit() y 7 <= len(limpio) <= 8:
         dv = calcular_dv(limpio); fmt = formatear_rut_limpio(limpio, dv)
-    elif len(limpio) >= 2 and RUT_DV_RE.search(limpio[-1:]):
+    elif len(limpio) >= 2 y RUT_DV_RE.search(limpio[-1:]):
         cuerpo, dv = limpio[:-1], limpio[-1].upper(); fmt = formatear_rut_limpio(cuerpo, dv)
     else:
         st.session_state["rut_status"] = "❌ RUT inválido (DV debe ser 0-9 o K)"
@@ -548,7 +563,7 @@ def on_dir_change_autovalidate():
         if not sug:
             st.session_state["dir_status"] = "❌ No se encontró la dirección"; return
         best = sug[0]; lat, lon = best.get("lat"), best.get("lon")
-        if not (lat and lon):
+        if not (lat y lon):
             st.session_state["dir_status"] = "❌ No se pudo normalizar (coordenadas faltantes)"; return
         rev = normalizar_direccion_por_latlon(lat, lon)
         if rev and "display_name" in rev:
@@ -834,6 +849,7 @@ def _limpiar_filtros():
     st.session_state["incluir_vtr"] = False
     st.session_state["servicios_sel_hogar"] = ["solo internet", "fibra + tv", "fibra + telefonía", "fibra + móvil"]
     st.session_state["servicios_sel_movil"] = ["solo internet móvil"]
+    st.session_state["velocidad_objetivo_sel"] = ["600 Mbps", "800 Mbps", "940 Mbps"]
     st.session_state["fibra_por_proveedor"] = {}
     st.toast("Filtros restablecidos")
 
@@ -855,13 +871,7 @@ with st.sidebar:
         placeholder="calle y número, comuna (ej: San Óscar 2807 Maipú)",
         on_change=on_dir_change_autovalidate
     )
-    st.caption(st.session_state.get("dir_status", "Escribe una dirección y presiona Enter"))
-
-    sug = st.session_state.get("dir_sugerencias", []) or []
-    if is_dev() and sug:
-        st.write("Coincidencias (top 3):")
-        for i, s in enumerate(sug[:3], start=1):
-            st.write(f"{i}. {s.get('display_name','')}")
+    # En modo user no mostramos sugerencias (UX limpia)
 
     st.divider()
 
@@ -876,6 +886,17 @@ with st.sidebar:
 
     st.divider()
     st.radio("¿Qué quieres comparar?", ["Hogar", "Móvil"], index=0, horizontal=True, key="modo_busqueda")
+
+    # ---- NUEVO: Velocidad objetivo (solo Hogar)
+    st.divider()
+    st.subheader("Velocidad objetivo (Hogar)")
+    vel_presets = ["300 Mbps", "500 Mbps", "600 Mbps", "800 Mbps", "940 Mbps", "1 Gbps", "1.5 Gbps", "2 Gbps"]
+    st.multiselect(
+        "Elige una o varias (comparación entre compañías)",
+        options=vel_presets,
+        default=st.session_state.get("velocidad_objetivo_sel", ["600 Mbps", "800 Mbps", "940 Mbps"]),
+        key="velocidad_objetivo_sel"
+    )
 
 # =================== Filtros según MODO ===================
 if st.session_state.get("modo_busqueda") == "Hogar":
@@ -956,6 +977,18 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                     df = df[df["__tipo"].isin(seleccion)]
                     df = df.drop(columns=["__tipo"], errors="ignore")
 
+                # ---- Filtro por VELOCIDAD objetivo (si seleccionaste alguna)
+                vel_targets = st.session_state.get("velocidad_objetivo_sel", []) or []
+                if vel_targets and not df.empty:
+                    vel_targets_mbps = []
+                    for v in vel_targets:
+                        n = vel_to_mbps(v)
+                        if n:
+                            vel_targets_mbps.append(n)
+                    if vel_targets_mbps:
+                        df["__vel_mbps"] = df["velocidad"].apply(vel_to_mbps)
+                        df = df[df["__vel_mbps"].isin(vel_targets_mbps)].copy()
+
                 # (Opcional) En modo dev, mostrar crudo sin dedup
                 if is_dev() and not df.empty:
                     with st.expander("🔎 Diagnóstico (dev): datos crudos antes de dedup"):
@@ -968,7 +1001,11 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                         grp = ["__prov","velocidad","pack seleccionado"]
                         idx_min = df.groupby(grp, dropna=False)["Precio_CLP"].idxmin()
                         df.loc[idx_min, "insignia"] = "🏷️ Oferta más barata"
-                        df = df.sort_values(by="Precio_CLP", na_position="last")
+                        # Orden por velocidad (si existe), luego por precio
+                        if "__vel_mbps" in df.columns:
+                            df = df.sort_values(by=["__vel_mbps","Precio_CLP"], ascending=[True, True], na_position="last")
+                        else:
+                            df = df.sort_values(by="Precio_CLP", na_position="last")
                         df = df.loc[~df.duplicated(subset=grp, keep="first")].copy()
                     else:
                         df = df.loc[~df.duplicated(subset=["__prov","velocidad","pack seleccionado"], keep="first")].copy()
@@ -976,18 +1013,48 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                 if df.empty:
                     st.info("No se encontraron planes que coincidan con los filtros (Hogar).")
                 else:
+                    # ---- Resumen comparativo por velocidad objetivo (mejor de cada compañía)
+                    if "__vel_mbps" in df.columns and not df.empty:
+                        resumen = []
+                        for v in sorted(df["__vel_mbps"].dropna().unique()):
+                            sub = df[df["__vel_mbps"] == v]
+                            for prov in ["mundo", "movistar", "entel", "wom", "vtr"]:
+                                sprov = sub[sub[prov] == "✔"].copy()
+                                if sprov.empty:
+                                    continue
+                                sprov = sprov.sort_values(by="Precio_CLP", na_position="last")
+                                top = sprov.iloc[0]
+                                resumen.append({
+                                    "velocidad (Mbps)": v,
+                                    "compañía": prov.capitalize(),
+                                    "pack": top.get("pack seleccionado", ""),
+                                    "precio oferta": top.get("precio oferta", ""),
+                                    "periodo": top.get("periodo oferta", ""),
+                                    "precio normal": top.get("precio normal", ""),
+                                    "instalación": top.get("instalación", ""),
+                                    "costo total": top.get("costo total", "")
+                                })
+                        if resumen:
+                            st.info("**Resumen comparativo por velocidad (mejor precio por compañía):**")
+                            st.dataframe(pd.DataFrame(resumen), use_container_width=True)
+
+                    # Columnas extra SOLO en dev
                     if is_dev():
-                        extras = ["__prov","__plan","Precio_CLP","__context_snippet"]
+                        extras = ["__prov","__plan","Precio_CLP","__context_snippet","__vel_mbps"]
                         extras = [c for c in extras if c in df.columns]
                         if extras:
                             with st.expander("🧰 (dev) Columnas auxiliares"):
                                 st.dataframe(df[extras].head(50), use_container_width=True)
 
+                    # Asegura columnas finales y order final
                     for c in cols_final:
                         if c not in df.columns:
                             df[c] = ""
-                    if "Precio_CLP" in df.columns:
+                    if "__vel_mbps" in df.columns:
+                        df = df.sort_values(by=["__vel_mbps","Precio_CLP"], ascending=[True, True], na_position="last")
+                    elif "Precio_CLP" in df.columns:
                         df = df.sort_values(by="Precio_CLP", na_position="last")
+
                     st.success("¡Ofertas Hogar encontradas!")
                     st.dataframe(df[cols_final], use_container_width=True)
 
@@ -1089,3 +1156,4 @@ else:
             except Exception as e:
                 st.error(f"Falla en la consulta Móvil: {e}")
                 st.caption("Si aparece un mensaje pidiendo `playwright install`, presiona el botón otra vez.")
+``
