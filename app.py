@@ -26,12 +26,23 @@ from playwright.async_api import async_playwright
 import requests
 
 # =================== Configuración de página ===================
-st.set_page_config(
-    page_title="Comparador Chile",
-    page_icon="📡",
-    menu_items={"Get Help": None, "Report a bug": None, "About": None},
-)
-st.title("📡 Mi Comparador Telecom")
+import streamlit as st
+ 
+# 1. Configuración inicial
+st.set_page_config(page_title="Comparador Chile", page_icon="📡")
+ 
+# 2. CÓDIGO PARA OCULTAR MENÚS (GitHub, Share, Deploy, etc.)
+hide_st_style = """
+            <style>
+            #MainMenu {visibility: hidden;}
+            header {visibility: hidden;}
+            footer {visibility: hidden;}
+            .stAppDeployButton {display:none;}
+            #stDecoration {display:none;}
+            </style>
+            """
+st.markdown(hide_st_style, unsafe_allow_html=True)
+st.title("📡 Mi Comparador Teleco")
 
 # =================== Utilidades base ===================
 @st.cache_resource(show_spinner=False)
