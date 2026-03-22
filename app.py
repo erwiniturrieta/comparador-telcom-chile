@@ -1,6 +1,6 @@
 # app.py
 # Comparador Telecom Chile - Hogar/Móvil
-# - Modo USER/DEV (por URL ?mode=, secrets MODE, env APP_MODE o toggle UI)
+# - Modo USER/DEV (URL ?mode=, secrets MODE, env APP_MODE o toggle UI)
 # - USER: oculta toolbar/Manage app/etc.; DEV: muestra todo + panel diagnóstico
 # - RUT: autoformato + validación (módulo-11)
 # - Dirección: forward-search → reverse (Nominatim) con ≤1 req/s
@@ -50,8 +50,7 @@ def get_app_mode() -> str:
 def inject_css_for_mode(mode: str):
     """Oculta/mostrar elementos del chrome según el modo."""
     if mode == "dev":
-        # No ocultar nada en vista desarrollador
-        return
+        return  # En dev, no ocultar nada
 
     # Vista USER: oculta toolbar, menús y 'Manage app' (selectors amplios)
     css = """
@@ -124,19 +123,25 @@ def ensure_chromium_installed():
         raise
 
 def run_async(coro):
+    """
+    Ejecuta una corrutina de forma segura:
+    - Si ya hay un event loop corriendo (Streamlit/Playwright), usa un loop nuevo aislado.
+    - Si no hay loop, usa asyncio.run(coro).
+    """
     try:
         loop = asyncio.get_event_loop()
-        if loop.is_running():
-            new_loop = asyncio.new_event_loop()
-            try:
-                asyncio.set_event_loop(new_loop)
-                return new_loop.run_until_complete(coro)
-            finally:
-                new_loop.close()
-                asyncio.set_event_loop(loop)
-        else:
-            return loop.run_until_complete(coro)
     except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        new_loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(new_loop)
+            return new_loop.run_until_complete(coro)
+        finally:
+            new_loop.close()
+            asyncio.set_event_loop(loop)
+    else:
         return asyncio.run(coro)
 
 # =================== Parsers / Regex comunes ===================
@@ -408,7 +413,6 @@ def extract_plans_via_regex(html: str, max_items: int = 24, ctx_window: int = 12
             "speed_hint": speed_hint,
             **price_payload
         }
-        # En modo dev, opcionalmente guarda un breve contexto
         if is_dev():
             keep = ctx[max(0, len(ctx)//2 - 300): min(len(ctx), len(ctx)//2 + 300)]
             row["__context_snippet"] = keep
@@ -647,7 +651,7 @@ def _row_from_dict(d: Dict, prov_flag: Dict[str, str], pack_tipo: str, velocidad
         row["__context_snippet"] = d["__context_snippet"]
     return row
 
-async def hogar_mundo() -> List[Dict]:
+def hogar_mundo() -> List[Dict]:
     urls = [
         "https://www.tumundo.cl/",
         "https://www.tumundo.cl/planes-hogar/fibra-3g/",
@@ -669,7 +673,7 @@ async def hogar_mundo() -> List[Dict]:
                                   infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
-async def hogar_movistar() -> List[Dict]:
+def hogar_movistar() -> List[Dict]:
     urls = [
         "https://ww2.movistar.cl/hogar/internet-hogar/",
         "https://ww2.movistar.cl/hogar/internet-fibra-optica/",
@@ -690,7 +694,7 @@ async def hogar_movistar() -> List[Dict]:
                                   infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
-async def hogar_entel() -> List[Dict]:
+def hogar_entel() -> List[Dict]:
     urls = [
         "https://www.entel.cl/hogar/internet",
         "https://www.entel.cl/hogar/fibra-optica",
@@ -709,7 +713,7 @@ async def hogar_entel() -> List[Dict]:
                                   infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
-async def hogar_wom() -> List[Dict]:
+def hogar_wom() -> List[Dict]:
     urls = [
         "https://store.wom.cl/hogar/internet-hogar",
         "https://store.wom.cl/hogar/internet-tv-hogar",
@@ -729,7 +733,7 @@ async def hogar_wom() -> List[Dict]:
                                   infer_pack(plan) if tipo.startswith("fibra") else tipo, velocidad))
     return out
 
-async def hogar_vtr() -> List[Dict]:
+def hogar_vtr() -> List[Dict]:
     urls = [
         "https://vtr.com/",
         "https://vtr.com/comparador-planes/",
@@ -751,7 +755,7 @@ async def hogar_vtr() -> List[Dict]:
     return out
 
 # =================== Scrapers MÓVIL ===================
-async def movistar_movil() -> List[Dict]:
+def movistar_movil() -> List[Dict]:
     urls = [
         "https://ww2.movistar.cl/movil/",
         "https://ww2.movistar.cl/ofertas/ofertador-movil/",
@@ -774,7 +778,7 @@ async def movistar_movil() -> List[Dict]:
         })
     return out
 
-async def entel_movil() -> List[Dict]:
+def entel_movil() -> List[Dict]:
     urls = [
         "https://www.entel.cl/soycliente/movil",
         "https://www.entel.cl/planes/telefonia-movil",
@@ -798,7 +802,7 @@ async def entel_movil() -> List[Dict]:
         })
     return out
 
-async def wom_movil() -> List[Dict]:
+def wom_movil() -> List[Dict]:
     urls = [
         "https://store.wom.cl/planes/",
         "https://store.wom.cl/planes/planes-portabilidad",
@@ -918,11 +922,11 @@ if st.session_state.get("modo_busqueda") == "Hogar":
         resultados: List[Dict] = []
         with st.spinner("Consultando proveedores (Hogar)…"):
             try:
-                if st.session_state.get("incluir_mundo"):    resultados.extend(run_async(hogar_mundo()))
-                if st.session_state.get("incluir_movistar"): resultados.extend(run_async(hogar_movistar()))
-                if st.session_state.get("incluir_entel"):    resultados.extend(run_async(hogar_entel()))
-                if st.session_state.get("incluir_wom"):      resultados.extend(run_async(hogar_wom()))
-                if st.session_state.get("incluir_vtr"):      resultados.extend(run_async(hogar_vtr()))
+                if st.session_state.get("incluir_mundo"):    resultados.extend(hogar_mundo())
+                if st.session_state.get("incluir_movistar"): resultados.extend(hogar_movistar())
+                if st.session_state.get("incluir_entel"):    resultados.extend(hogar_entel())
+                if st.session_state.get("incluir_wom"):      resultados.extend(hogar_wom())
+                if st.session_state.get("incluir_vtr"):      resultados.extend(hogar_vtr())
 
                 df = pd.DataFrame(resultados)
 
@@ -972,7 +976,6 @@ if st.session_state.get("modo_busqueda") == "Hogar":
                 if df.empty:
                     st.info("No se encontraron planes que coincidan con los filtros (Hogar).")
                 else:
-                    # Columnas extra SOLO en dev
                     if is_dev():
                         extras = ["__prov","__plan","Precio_CLP","__context_snippet"]
                         extras = [c for c in extras if c in df.columns]
@@ -1003,9 +1006,9 @@ else:
         resultados_movil: List[Dict] = []
         with st.spinner("Consultando planes móviles…"):
             try:
-                if st.session_state.get("incluir_movistar"): resultados_movil.extend(run_async(movistar_movil()))
-                if st.session_state.get("incluir_entel"):    resultados_movil.extend(run_async(entel_movil()))
-                if st.session_state.get("incluir_wom"):      resultados_movil.extend(run_async(wom_movil()))
+                if st.session_state.get("incluir_movistar"): resultados_movil.extend(movistar_movil())
+                if st.session_state.get("incluir_entel"):    resultados_movil.extend(entel_movil())
+                if st.session_state.get("incluir_wom"):      resultados_movil.extend(wom_movil())
 
                 dfm = pd.DataFrame(resultados_movil)
 
