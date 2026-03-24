@@ -337,56 +337,71 @@ def _extract_offer_period(around_text: str) -> str:
     return "12 meses"
 
 def _choose_prices_from_context(ctx: str) -> Optional[Dict[str, Optional[str]]]:
-    """Devuelve: price_offer_str/_int, offer_period_str, price_normal_str/_int, install_cost_int, install_free."""
+    """
+    Nuevo extractor de precios:
+      ✔ Detecta precio oferta normalmente por /mes, al mes, por N meses.
+      ✔ Detecta precio normal por patrones explícitos (luego $xx.xxx, precio normal $xx.xxx)
+      ✔ Instalación igual que antes.
+    """
     if not ctx:
         return None
 
-    labels = []
+    # ----------- PRECIO OFERTA (igual que antes) -----------
+    monthly = []
     for m in PRICE_RE.finditer(ctx):
-        ps = m.group(0)
-        pi = clp_to_int(ps)
-        lb = _label_price_in_context(ctx, m.start(), m.end(), window=160)
-        labels.append((lb, ps, pi, m.start(), m.end()))
+        start = m.start()
+        end = m.end()
+        around = ctx[max(0, start-200): min(len(ctx), end+200)].lower()
+        if MONTHLY_NEAR_RE.search(around):
+            ps = m.group(0)
+            pi = clp_to_int(ps)
+            if pi >= MIN_MONTHLY_CLP:
+                monthly.append((ps, pi, start, end))
 
-    # Oferta mensual válida
-    monthly = [(ps, pi, s, e) for (lb, ps, pi, s, e) in labels if lb == "monthly" and pi >= MIN_MONTHLY_CLP]
     price_offer_str = None
     price_offer_int = None
     offer_period_str = ""
+
     if monthly:
         price_offer_str, price_offer_int, s_off, e_off = sorted(monthly, key=lambda x: x[1])[0]
-        s = max(0, s_off - 160); e = min(len(ctx), e_off + 160)
-        offer_period_str = _extract_offer_period(ctx[s:e]) or ""
+        around = ctx[max(0, s_off-200): min(len(ctx), e_off+200)]
+        offer_period_str = _extract_offer_period(around) or ""
 
-    # Precio normal/luego — 1er pase (±160)
-    laters = [(ps, pi, s, e) for (lb, ps, pi, s, e) in labels if lb == "later" and pi >= MIN_MONTHLY_CLP]
-
-    # 2º pase con ventana ampliada (±200) si no encontramos
-    if not laters:
-        for m in PRICE_RE.finditer(ctx):
-            ps = m.group(0); pi = clp_to_int(ps)
-            lb2 = _label_price_in_context(ctx, m.start(), m.end(), window=200)
-            if lb2 == "later" and pi >= MIN_MONTHLY_CLP:
-                laters.append((ps, pi, m.start(), m.end()))
-
+    # ----------- PRECIO NORMAL (nuevo método robusto) -----------
     price_normal_str = None
     price_normal_int = None
-    if laters:
-        price_normal_str, price_normal_int, _s, _e = sorted(laters, key=lambda x: x[1])[0]
 
-    # Instalación
+    # patrón 1: "luego $xx.xxx"
+    m1 = re.search(r"(luego|después|despues).*?(\$\s?\d{1,3}(?:\.\d{3})+)", ctx, re.IGNORECASE)
+    if m1:
+        price_normal_str = m1.group(2)
+        price_normal_int = clp_to_int(price_normal_str)
+
+    # patrón 2: "precio normal $xx.xxx"
+    m2 = re.search(r"(precio\s*normal).*?(\$\s?\d{1,3}(?:\.\d{3})+)", ctx, re.IGNORECASE)
+    if m2:
+        cand = m2.group(2)
+        cand_int = clp_to_int(cand)
+        if price_normal_int is None or cand_int < price_normal_int:
+            price_normal_str = cand
+            price_normal_int = cand_int
+
+    # ----------- INSTALACIÓN (igual que antes) -----------
     install_cost_int = None
     install_free = False
-    if re.search(r"instalaci[oó]n[^$]{0,40}(sin\s*costo|gratis)", ctx, flags=re.IGNORECASE):
+
+    if re.search(r"instalaci[oó]n[^$]{0,60}(sin\s*costo|gratis)", ctx, flags=re.IGNORECASE):
         install_free = True
         install_cost_int = 0
     else:
-        inst = [(ps, pi) for (lb, ps, pi, s, e) in labels if lb == "install"]
-        if inst:
-            ps, pi = sorted(inst, key=lambda x: x[1])[0]
-            install_cost_int = pi
-            install_free = (pi == 0)
+        for m in PRICE_RE.finditer(ctx):
+            around = ctx[max(0, m.start()-200): min(len(ctx), m.end()+200)].lower()
+            if INSTALL_OR_EXTRA_RE.search(around):
+                install_cost_int = clp_to_int(m.group(0))
+                install_free = (install_cost_int == 0)
+                break
 
+    # Si no hay ningún precio, descartar tarjeta
     if not price_offer_int and not price_normal_int:
         return None
 
